@@ -53,19 +53,22 @@ class GaussianTrainer:
         BLOCK_H, BLOCK_W = 16, 16
         self.iterations = iterations
 
-        # # ffhq config
+        # # --- 20000 points setup ---
         # self.freq_config = {
-        #     "low": [0, 100, 1200],
-        #     "high": [100, self.num_comps, self.num_points - 1200],
+        #     "low": [0, 50, 2000],
+        #     "high": [50, self.num_comps, self.num_points - 2000],
         #     "all": [0, self.num_comps, self.num_points]
         # }
+        # # --------------------------
 
-        # celeba config
+        # --- 5000 points setup ---
         self.freq_config = {
             "low": [0, 50, 500],
             "high": [50, self.num_comps, self.num_points - 500],
             "all": [0, self.num_comps, self.num_points]
         }
+        # -------------------------
+
         self.model_dir = model_dir
         self.model_dir.mkdir(parents=True, exist_ok=True)
         self.gaussian_model = GaussianBasis(
@@ -305,7 +308,6 @@ class GaussianTrainer:
         with torch.no_grad():
             out = self.gaussian_model(render_colors=True)
         image = out.reshape(3, -1) + self.gaussian_model.image_mean
-        # image = torch.clamp(image, 0, 1)
         image = image.reshape(3, height, width)
         mse_loss = F.mse_loss(image.float(), self.gt_image.float())
         psnr = 10 * math.log10(1.0 / mse_loss.item())
@@ -418,10 +420,6 @@ def get_report(args, results):
             'iterations': iters,
             'thres_counts': counters
         },
-        # 'periodic_data': {
-        #     'times': avg_log_times,
-        #     'psnrs': avg_log_psnrs
-        # },
         'total_samples': len(results)
     }
     with open(model_dir / 'report.json', 'w') as f:
@@ -432,16 +430,6 @@ def get_report(args, results):
         'psnrs': avg_log_psnrs,
         'iter_event': all_iter_event,
     }
-    # periodic_data = {
-    #     'times': {
-    #         'avg': avg_log_times,
-    #         'all': all_log_times
-    #     },
-    #     'psnrs': {
-    #         'avg': avg_log_psnrs,
-    #         'all': all_log_psnrs
-    #     },
-    # }
     with open(model_dir / 'periodic_data.json', 'w') as f:
         json.dump(periodic_data, f, indent=4)
 
@@ -468,8 +456,6 @@ def main(argv):
         )
         res = trainer.optimize()
         results.append(res)
-        # if idx == 2:
-        #     break
     get_report(args, results)
 
 if __name__ == "__main__":

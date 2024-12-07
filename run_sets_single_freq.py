@@ -120,6 +120,7 @@ class GaussianTrainer:
     def optimize(self):
         # profiler = cProfile.Profile()
         # profiler.enable()
+
         progress_bar = tqdm(range(1, self.iterations+1), desc="Optimizing progress")
         self.update_gaussian()
         init_psnr, init_ssim = self.test(init=True)
@@ -292,7 +293,6 @@ class GaussianTrainer:
         with torch.no_grad():
             out = self.gaussian_model(render_colors=True)
         image = out.reshape(3, -1) + self.gaussian_model.image_mean
-        # image = torch.clamp(image, 0, 1)
         image = image.reshape(3, height, width)
         mse_loss = F.mse_loss(image.float(), self.gt_image.float())
         psnr = 10 * math.log10(1.0 / mse_loss.item())
@@ -441,8 +441,6 @@ def main(argv):
         )
         res = trainer.optimize()
         results.append(res)
-        # if idx == 2:
-        #     break
     get_report(args, results)
 
 if __name__ == "__main__":

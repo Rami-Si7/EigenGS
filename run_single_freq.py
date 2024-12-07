@@ -42,8 +42,6 @@ class GaussianTrainer:
             img = Image.open(self.image_path)
             img_arr = (color.rgb2ycbcr(img) / 255.0).transpose(2, 0, 1)
             self.gt_image = torch.tensor(img_arr, dtype=torch.float32, device=self.device)
-            # transform = transforms.ToTensor()
-            # self.gt_image = transform(img).to(self.device)
             model_dir = Path(f"./models/recons/{self.image_name}-{self.dataset_path.name}-{num_points}-{args.iterations}-{random_string}")
         else: 
             model_dir = Path(f"./models/single-freq/{self.dataset_path.name}-{num_points}-{args.iterations}-{random_string}")
@@ -225,32 +223,31 @@ class GaussianTrainer:
         vis_dir.mkdir(parents=True, exist_ok=True)
         img.save(vis_dir / f"test_pca.png")
 
-    # def test_pca(self):
-    #     with open(self.dataset_path / "pca_object.pkl", "rb") as FIN:
-    #         pca_object = pickle.load(FIN)
-    #     _, _, height, width = self.gt_arrs.shape  # (300, 3, 256, 256)
-    #     img_arr = self.gt_image.detach().cpu().numpy()  # (3, 256, 256)
-    #     img_arr = img_arr.reshape(3, -1)
+    def test_pca(self):
+        with open(self.dataset_path / "pca_object.pkl", "rb") as FIN:
+            pca_object = pickle.load(FIN)
+        _, _, height, width = self.gt_arrs.shape  # (300, 3, 256, 256)
+        img_arr = self.gt_image.detach().cpu().numpy()  # (3, 256, 256)
+        img_arr = img_arr.reshape(3, -1)
 
-    #     ycbcr_img = []
-    #     for idx, ch_arr in enumerate(img_arr):
-    #         pca = pca_object[idx]
-    #         codes = pca.transform(ch_arr.reshape(1, -1))
-    #         recons = pca.inverse_transform(codes).copy()
-    #         recons *= 255.0
-    #         recons = recons.reshape(height, width)
-    #         ycbcr_img.append(recons)
+        ycbcr_img = []
+        for idx, ch_arr in enumerate(img_arr):
+            pca = pca_object[idx]
+            codes = pca.transform(ch_arr.reshape(1, -1))
+            recons = pca.inverse_transform(codes).copy()
+            recons *= 255.0
+            recons = recons.reshape(height, width)
+            ycbcr_img.append(recons)
 
-    #     ycbcr_img = np.stack(ycbcr_img)
-    #     ycbcr_img = ycbcr_img.transpose(1, 2, 0)
-    #     rgb_img = ycbcr_img
-    #     rgb_img = rgb_img.clip(0, 255)
+        ycbcr_img = np.stack(ycbcr_img)
+        ycbcr_img = ycbcr_img.transpose(1, 2, 0)
+        rgb_img = ycbcr_img
+        rgb_img = rgb_img.clip(0, 255)
 
-    #     img = Image.fromarray(rgb_img.astype(np.uint8))
-    #     vis_dir = self.model_dir / f"vis"
-    #     vis_dir.mkdir(parents=True, exist_ok=True)
-    #     img.save(vis_dir / f"test_pca.png")
-    #     breakpoint()
+        img = Image.fromarray(rgb_img.astype(np.uint8))
+        vis_dir = self.model_dir / f"vis"
+        vis_dir.mkdir(parents=True, exist_ok=True)
+        img.save(vis_dir / f"test_pca.png")
 
     def test(self, iter=None):
         self.gaussian_model.eval()
@@ -329,9 +326,8 @@ def main(argv):
     if not args.skip_train:
         trainer.train()
     else:
-        trainer.test_pca()
+        # trainer.test_pca()
         trainer.optimize()
-    # trainer.test_comps()
  
 if __name__ == "__main__":
     main(sys.argv[1:])

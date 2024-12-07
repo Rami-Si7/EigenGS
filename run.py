@@ -52,32 +52,21 @@ class GaussianTrainer:
         BLOCK_H, BLOCK_W = 16, 16
         self.iterations = iterations
 
-        # # ffhq config
+        # # --- 20000 points setup ---
         # self.freq_config = {
-        #     "low": [0, 100, 1200],
-        #     "high": [100, self.num_comps, self.num_points - 1200],
+        #     "low": [0, 50, 2000],
+        #     "high": [50, self.num_comps, self.num_points - 2000],
         #     "all": [0, self.num_comps, self.num_points]
         # }
+        # # --------------------------
 
-        # # celeba config
-        # self.freq_config = {
-        #     "low": [0, 100, 800],
-        #     "high": [100, self.num_comps, self.num_points - 800],
-        #     "all": [0, self.num_comps, self.num_points]
-        # }
-
-        # cats config
+        # --- 5000 points setup ---
         self.freq_config = {
             "low": [0, 50, 500],
             "high": [50, self.num_comps, self.num_points - 500],
             "all": [0, self.num_comps, self.num_points]
         }
-        # # imagenette config
-        # self.freq_config = {
-        #     "low": [0, 150, 2000],
-        #     "high": [150, self.num_comps, self.num_points - 500],
-        #     "all": [0, self.num_comps, self.num_points]
-        # }
+        # -------------------------
 
         self.model_dir = model_dir
         self.model_dir.mkdir(parents=True, exist_ok=True)
@@ -364,7 +353,7 @@ def main(argv):
         trainer.train(freq="high")
         trainer.merge_freq()
     else:
-        trainer.test_pca()
+        # trainer.test_pca()
         trainer.optimize()
  
 if __name__ == "__main__":
