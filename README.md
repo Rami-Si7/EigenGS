@@ -23,11 +23,18 @@ pip install -r requirements.txt
 
 ## Demo with ImageNet Basis
 
-We provide a demo using EigenGS trained with PCA components from ImageNet, and evaluate on the FFHQ dataset. You can download trained EigenGS model for `step 3` evaluation, or train from the ImageNet images by following steps. 
+We provide a demo using EigenGS trained with PCA components from [ImageNet](https://www.icloud.com/iclouddrive/04fbVOqtOeQCRA52Ef05QNsLA#ImageNet), and evaluate on the [FFHQ](https://www.icloud.com/iclouddrive/0bfGI1wc4x-2Y2w4ASynV6SfA#FFHQ) dataset. 
+The [parsed data](https://www.icloud.com/iclouddrive/0787LHytmNDuWM4zSBdOMRlMg#imagenet-ffhq-300-ycbcr) and trained [EigenGS](https://www.icloud.com/iclouddrive/0d30IWn45tl4phrGCbFfk2BqQ#imagenet-ffhq-300-ycbcr-20000-15000-d37b07) can be downloaded for `step 3` evaluation. If you are interested in using the custom images, please follow the steps below. 
 
 ### 1. Dataset Preparation
 
-Parse your image dataset to the required format:
+Parse your image dataset to the required format, the `parse.py` will generated:
+
+- `arrs.npy`: Numpy array with PCA components information.
+- `norm_infos.pkl`: Normalization information of the components.
+- `pca_object.pkl`: Sklearn PCA object.
+
+Also, the processed images will be organized into `test_imgs` and `train_imgs` folders. You should replace their contents with target test and training images.
 
 ```bash
 python parse.py --source <path to images> \
@@ -39,6 +46,8 @@ python parse.py --source <path to images> \
 **Note**: The `img_size` parameter should match the dimensions of test image.
 
 ### 2. Train EigenGS Model
+
+We recommand to train with Frequency-Aware for larger test image.
 
 #### W/O Frequency-Aware
 ```bash
@@ -58,11 +67,11 @@ python run.py -d <path to parsed dataset> \
 
 ### 3. Evaluation
 
-After training, evaluate the performance on test images set using either:
+After training, evaluate the performance on test images set. Please use `run.py` for the data we prepared in previous section.
 
 #### Frequency-Aware Evaluation
 ```bash
-python run_sets_single_freq.py -d <path to parsed dataset> \
+python run_sets.py -d <path to parsed dataset> \
     --model_path <path to eigengs model> \
     --num_points <number of gaussian points> \
     --iterations <number of training iterations> \
@@ -71,7 +80,7 @@ python run_sets_single_freq.py -d <path to parsed dataset> \
 
 #### Single Frequency Evaluation
 ```bash
-python run_sets.py -d <path to parsed dataset> \
+python run_sets_single_freq.py -d <path to parsed dataset> \
     --model_path <path to eigengs model> \
     --num_points <number of gaussian points> \
     --iterations <number of training iterations> \
