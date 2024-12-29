@@ -8,7 +8,7 @@ EigenGS is a novel method that bridges Principal Component Analysis (PCA) and Ga
 
 Clone the repository with `--recursive` option:
 ```bash
-git clone https://github.com/lw-ethan/EigenGS.git --recursive
+git clone https://github.com/vllab/EigenGS.git --recursive
 ``` 
 
 Install CUDA backend `gsplat`:
