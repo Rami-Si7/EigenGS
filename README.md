@@ -1,22 +1,21 @@
 # EigenGS: From Eigenspace to Gaussian Image Space
 
-EigenGS is a novel method that bridges Principal Component Analysis (PCA) and Gaussian Splatting for efficient image representation. Our approach enables instant initialization of Gaussian parameters for new images without requiring per-image training from scratch.
+EigenGS is a novel method that bridges Principal Component Analysis (PCA) and Gaussian Splatting for efficient image representation. Our approach enables instant initialization of Gaussian parameters for new images without requiring per-image training from random parameters.
 
 ## Quick Start
 
 ### Installation
-
-Clone the repository with `--recursive` option:
+We recommand to use python 3.10 and pytoch 2.5.0 to run our project.
+1. Clone the repository with `--recursive` option:
 ```bash
 git clone https://github.com/vllab/EigenGS.git --recursive
 ``` 
-
-Install CUDA backend `gsplat`:
+2. Install CUDA backend `gsplat`:
 ```bash
 cd gsplat
 pip install .[dev]
 ```
-Install other python modules:
+3. Install other python modules:
 ```bash
 pip install -r requirements.txt
 ```
