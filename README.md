@@ -5,7 +5,7 @@ EigenGS is a novel method that bridges Principal Component Analysis (PCA) and Ga
 ## Quick Start
 
 ### Installation
-We recommand to use python 3.10 and pytoch 2.5.0 to run our project.
+We recommand using python 3.10 and pytoch 2.5.0 to run our project.
 1. Clone the repository with `--recursive` option:
 ```bash
 git clone https://github.com/vllab/EigenGS.git --recursive

@@ -53,21 +53,21 @@ class GaussianTrainer:
         BLOCK_H, BLOCK_W = 16, 16
         self.iterations = iterations
 
-        # # --- 20000 points setup ---
-        # self.freq_config = {
-        #     "low": [0, 50, 2000],
-        #     "high": [50, self.num_comps, self.num_points - 2000],
-        #     "all": [0, self.num_comps, self.num_points]
-        # }
-        # # --------------------------
-
-        # --- 5000 points setup ---
+        # --- 20000 points setup ---
         self.freq_config = {
-            "low": [0, 50, 500],
-            "high": [50, self.num_comps, self.num_points - 500],
+            "low": [0, 50, 2000],
+            "high": [50, self.num_comps, self.num_points - 2000],
             "all": [0, self.num_comps, self.num_points]
         }
-        # -------------------------
+        # --------------------------
+
+        # # --- 5000 points setup ---
+        # self.freq_config = {
+        #     "low": [0, 50, 500],
+        #     "high": [50, self.num_comps, self.num_points - 500],
+        #     "all": [0, self.num_comps, self.num_points]
+        # }
+        # # -------------------------
 
         self.model_dir = model_dir
         self.model_dir.mkdir(parents=True, exist_ok=True)
