@@ -67,7 +67,7 @@ python run.py -d <path to parsed dataset> \
 
 ### 3. Evaluation
 
-After training, evaluate the performance on test images set. Please use `run.py` for the data we prepared in previous section.
+After training, evaluate the performance on test images set. Please note that when running the demo we prepared, the `--num_points` should be set as 20000, and it should be run with frequency-aware script.
 
 #### Frequency-Aware Evaluation
 ```bash
