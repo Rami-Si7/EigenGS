@@ -8,6 +8,8 @@ import argparse
 import tqdm
 import shutil
 import uuid
+import torch
+from testEM2 import EMLikeAlg, computeCost
 
 def visualize(output_dir):
     vis_dir = output_dir / "vis"
@@ -87,10 +89,57 @@ def prepare_arrs(args, output_dir):
     visualize(output_dir)
     return pca_object, norm_infos
 
+def prepare_clustered_pca(args, output_dir):
+    train_dir = output_dir / "train_imgs"
+    img_list = sorted(train_dir.glob("*.png"))
+
+    all_pixels = []
+    for path in tqdm.tqdm(img_list, desc="Loading images"):
+        img = Image.open(path)
+        ycbcr = color.rgb2ycbcr(np.array(img)) / 255.0  # (H, W, 3)
+        flattened = ycbcr.reshape(-1, 3)
+        all_pixels.append(flattened)
+
+    P = np.concatenate(all_pixels, axis=0)  # shape (num_pixels, 3)
+    w = np.ones(len(P))  # uniform weights
+
+    print(f"Running EM-like algorithm for (k={args.k_clusters}, j={args.subspace_dim})")
+    Vs, _ = EMLikeAlg(
+    P_np=P, 
+    j=args.subspace_dim,
+    k=args.k_clusters,
+    steps=20,
+    num_init=5,
+    max_points=500000
+)
+
+    Vs = torch.tensor(Vs, dtype=torch.float32)  # before computeCost
+    P = torch.tensor(P, dtype=torch.float32)
+    w = torch.ones(len(P), dtype=torch.float32)
+    _, _, cluster_ids = computeCost(P, w, Vs, show_indices=True)
+
+    # Compute per-cluster means μ_c
+    means = []
+    for c in range(args.k_clusters):
+        cluster_points = P[cluster_ids == c]
+        if len(cluster_points) == 0:
+            print(f"Warning: cluster {c} is empty!")
+            means.append(np.zeros(3))
+        else:
+            means.append(cluster_points.mean(axis=0))
+    means = np.stack(means, axis=0)  # (C, 3)
+
+    # Save
+    np.save(output_dir / "cluster_pcas.npy", Vs)
+    np.save(output_dir / "cluster_means.npy", means)
+    np.save(output_dir / "cluster_ids.npy", cluster_ids)
+
+    print("Saved clustered PCA bases and means.")
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Parse image set")
     parser.add_argument("-s", "--source", required=True, type=Path)
-    parser.add_argument("-c", "--n_comps", type=int, default=300)
+    parser.add_argument("-c", "--subspace_dim", type=int, default=300)
+    parser.add_argument("--k_clusters", type=int, default=4)
     parser.add_argument("-n", "--n_samples", type=int, default=10000)
     parser.add_argument("-t", "--n_test", type=int, default=100)
     parser.add_argument(
@@ -98,16 +147,19 @@ if __name__ == "__main__":
         default=[512, 512], metavar=('width', 'height'),
         help="Target image size as width height (e.g., 512 512)"
     )
+
     
     args = parser.parse_args()
     random_string = str(uuid.uuid4())[:6]
-    output_dir = args.source.parent / f"{random_string}-{args.n_comps}"
+    output_dir = args.source.parent / f"{random_string}-{args.subspace_dim}"
     output_dir.mkdir(parents=True, exist_ok=True)
     
     prepare_imgs(args, output_dir)
-    pca_object, norm_infos = prepare_arrs(args, output_dir)
+    prepare_clustered_pca(args, output_dir)
+
+    # pca_object, norm_infos = prepare_arrs(args, output_dir)
     
-    with open(output_dir / "pca_object.pkl", "wb") as FOUT:
-        pickle.dump(pca_object, FOUT)
-    with open(output_dir / "norm_infos.pkl", "wb") as FOUT:
-        pickle.dump(norm_infos, FOUT)
+    # with open(output_dir / "pca_object.pkl", "wb") as FOUT:
+    #     pickle.dump(pca_object, FOUT)
+    # with open(output_dir / "norm_infos.pkl", "wb") as FOUT:
+    #     pickle.dump(norm_infos, FOUT)
