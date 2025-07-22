@@ -10,5 +10,4 @@ PyYAML
 tqdm
 argparse
 matplotlib
-cProfile
 psutil
