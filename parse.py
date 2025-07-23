@@ -89,52 +89,104 @@ def prepare_arrs(args, output_dir):
     visualize(output_dir)
     return pca_object, norm_infos
 
+
+import numpy as np
+import tqdm
+from PIL import Image
+from skimage import color
+from testEM2 import EMLikeAlg, computeCost
+
 def prepare_clustered_pca(args, output_dir):
     train_dir = output_dir / "train_imgs"
     img_list = sorted(train_dir.glob("*.png"))
 
-    all_pixels = []
+    flattened_images = []
     for path in tqdm.tqdm(img_list, desc="Loading images"):
-        img = Image.open(path)
-        ycbcr = color.rgb2ycbcr(np.array(img)) / 255.0  # (H, W, 3)
-        flattened = ycbcr.reshape(-1, 3)
-        all_pixels.append(flattened)
+        img = Image.open(path).resize(tuple(args.img_size))
+        ycbcr = color.rgb2ycbcr(np.array(img)) / 255.0
+        y_channel = ycbcr[:, :, 0]  # Extract luminance (Y)
+        flat = y_channel.reshape(-1)  # Flatten into (H * W,)
+        flattened_images.append(flat)
 
-    P = np.concatenate(all_pixels, axis=0)  # shape (num_pixels, 3)
-    w = np.ones(len(P))  # uniform weights
+    # Stack into (N_images, D)
+    P = np.stack(flattened_images, axis=0).astype(np.float32)
+    w = np.ones(P.shape[0], dtype=np.float32)  # uniform weights
 
     print(f"Running EM-like algorithm for (k={args.k_clusters}, j={args.subspace_dim})")
     Vs, _ = EMLikeAlg(
-    P_np=P, 
-    j=args.subspace_dim,
-    k=args.k_clusters,
-    steps=20,
-    num_init=5,
-    max_points=500000
-)
+        P=P,
+        w=w,
+        j=args.subspace_dim,
+        k=args.k_clusters,
+        steps=8,
+        NUM_INIT_FOR_EM=1
+    )
 
-    Vs = torch.tensor(Vs, dtype=torch.float32)  # before computeCost
-    P = torch.tensor(P, dtype=torch.float32)
-    w = torch.ones(len(P), dtype=torch.float32)
+    # Compute cluster assignments
     _, _, cluster_ids = computeCost(P, w, Vs, show_indices=True)
 
-    # Compute per-cluster means μ_c
+    # Compute cluster means
+    means = []
+    for c in range(args.k_clusters):
+        cluster_points = P[cluster_ids == c]
+        if len(cluster_points) == 0:
+            print(f"⚠️ Warning: cluster {c} is empty!")
+            means.append(np.zeros(P.shape[1], dtype=np.float32))
+        else:
+            means.append(cluster_points.mean(axis=0))
+    means = np.stack(means, axis=0)  # (C, D)
+
+    # Save everything
+    np.save(output_dir / "cluster_pcas.npy", Vs)
+    np.save(output_dir / "cluster_means.npy", means)
+    np.save(output_dir / "cluster_ids.npy", cluster_ids)
+    print("✅ Clustered subspaces, means, and assignments saved.")
+def prepare_clustered_pca(args, output_dir):
+    train_dir = output_dir / "train_imgs"
+    img_list = sorted(train_dir.glob("*.png"))
+
+    flattened_images = []
+    for path in tqdm.tqdm(img_list, desc="Loading images"):
+        img = Image.open(path).resize(tuple(args.img_size))
+        ycbcr = color.rgb2ycbcr(np.array(img)) / 255.0
+        y_channel = ycbcr[:, :, 0]  # take Y only
+        flat = torch.tensor(y_channel, dtype=torch.float32, device='cuda').reshape(-1)
+        flattened_images.append(flat)
+
+    # Already on GPU
+    P = torch.stack(flattened_images, dim=0)  # (N_images, D)
+    w = torch.ones(len(P), dtype=torch.float32, device='cuda')  # put weights on GPU
+
+    print(f"Running EM-like algorithm for (k={args.k_clusters}, j={args.subspace_dim})")
+    Vs, _ = EMLikeAlg(
+        P_np=P,  # already torch tensor on GPU
+        j=args.subspace_dim,
+        k=args.k_clusters,
+        steps=20,
+        num_init=5,
+        max_points=500000
+    )
+
+    # Now keep everything on GPU
+    Vs_tensor = torch.tensor(Vs, dtype=torch.float32, device='cuda')
+    _, _, cluster_ids = computeCost(P, w, Vs_tensor, show_indices=True)
+
     means = []
     for c in range(args.k_clusters):
         cluster_points = P[cluster_ids == c]
         if len(cluster_points) == 0:
             print(f"Warning: cluster {c} is empty!")
-            means.append(np.zeros(3))
+            means.append(torch.zeros(P.shape[1], device='cuda'))
         else:
-            means.append(cluster_points.mean(axis=0))
-    means = np.stack(means, axis=0)  # (C, 3)
+            means.append(cluster_points.mean(dim=0))
+    means = torch.stack(means, dim=0)
 
-    # Save
-    np.save(output_dir / "cluster_pcas.npy", Vs)
-    np.save(output_dir / "cluster_means.npy", means)
-    np.save(output_dir / "cluster_ids.npy", cluster_ids)
+    # Save to disk as numpy (must move to CPU first)
+    np.save(output_dir / "cluster_pcas.npy", Vs_tensor.cpu().numpy())
+    np.save(output_dir / "cluster_means.npy", means.cpu().numpy())
+    np.save(output_dir / "cluster_ids.npy", cluster_ids.cpu().numpy())
 
-    print("Saved clustered PCA bases and means.")
+    print("Saved clustered EM bases and means for flattened image patches.")
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Parse image set")
     parser.add_argument("-s", "--source", required=True, type=Path)
