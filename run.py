@@ -70,11 +70,20 @@ class GaussianTrainer:
 
         self.model_dir = model_dir
         self.model_dir.mkdir(parents=True, exist_ok=True)
+        # Load clustered PCA bases and (optional) cluster means
+        cluster_bases = torch.from_numpy(np.load(output_dir / "cluster_pcas.npy")).float().to(self.device)  # (C, j, 2)
+        cluster_means = torch.from_numpy(np.load(output_dir / "cluster_means.npy")).float().to(self.device)  # (C, 3)
+
         self.gaussian_model = GaussianBasis(
-            loss_type="L2", opt_type="adan", num_points=self.num_points,
-            H=self.H, W=self.W, BLOCK_H=BLOCK_H, BLOCK_W=BLOCK_W, 
-            device=self.device, lr=args.lr, num_comps=self.num_comps,
-            gt_arrs=self.gt_arrs, freq_config=self.freq_config).to(self.device)
+            loss_type="L2", opt_type="adan",
+            num_points=self.num_points,
+            H=self.H, W=self.W, BLOCK_H=BLOCK_H, BLOCK_W=BLOCK_W,
+            device=self.device, lr=args.lr,
+            num_clusters=cluster_bases.shape[0],
+            subspace_dim=cluster_bases.shape[1],
+            cluster_bases=cluster_bases,
+            cluster_means=cluster_means  # optional
+        ).to(self.device)
 
         self.logwriter = LogWriter(self.model_dir)
         self.psnr_tracker = PSNRTracker(self.logwriter)
