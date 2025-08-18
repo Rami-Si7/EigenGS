@@ -120,6 +120,11 @@ class GaussianTrainer:
             h = int(np.sqrt(D))
             w = int(D // h)
         self.H, self.W = h, w
+        self.iterations = iterations
+        # representative images per cluster for side-by-side snapshots
+        self.cluster_ids = np.load(self.dataset_path / "cluster_ids.npy")          # (N_train,)
+        self.train_img_paths = sorted((self.dataset_path / "train_imgs").glob("*.png"))
+        self.val_every = max(1000, self.iterations // 5)  # periodic validation interval (optional)
 
         random_string = str(uuid.uuid4())[:6]
         if image_path is not None:
@@ -134,20 +139,14 @@ class GaussianTrainer:
         
         self.num_points = num_points
         BLOCK_H, BLOCK_W = 16, 16
-        self.iterations = iterations
 
-        # --- freq split (robust to small num_comps/num_points) ---
-        # how many PCA comps to devote to "low" band (cap at total comps)
-        low_comp_cap = min(5, self.num_comps)
-        # how many Gaussians to devote to "low" band (cap at total points)
-        low_pts_cap  = min(2000, self.num_points)
-        high_pts_cap = self.num_points - low_pts_cap  # can be 0 if very small model
-
+        # in GaussianTrainer.__init__
         self.freq_config = {
-            "low":  [0,              low_comp_cap,     low_pts_cap],
-            "high": [low_comp_cap,   self.num_comps,   max(high_pts_cap, 0)],
-            "all":  [0,              self.num_comps,   self.num_points],
+            "low":  [0, self.num_comps, self.num_points],   # unused in regular mode
+            "high": [self.num_comps, self.num_comps, 0],    # empty
+            "all":  [0, self.num_comps, self.num_points]
         }
+
         # ----------------------------------------------------------
 
 
@@ -197,6 +196,43 @@ class GaussianTrainer:
         self.active_cluster_id = int(cid)
         dummy_w = torch.zeros(3, self.num_comps, device=self.device)
         self.gaussian_model.set_cluster_and_proj(self.active_cluster_id, dummy_w)
+    def _save_cluster_stage_sxs(self, cid: int, freq: str, tag: str = "final"):
+        """
+        Pick one training image from this cluster, project to its cluster PCA to get w,
+        render current model (ψ' & geometry) with forward_kpca_init, and save GT|Pred.
+        """
+        # find a representative training image for this cluster
+        idxs = np.where(self.cluster_ids == cid)[0]
+        if idxs.size == 0:
+            self.logwriter.write(f"[Cluster {cid}] No train image found for side-by-side.")
+            return
+        img_path = self.train_img_paths[int(idxs[0])]
+        img = Image.open(img_path).resize((self.W, self.H))
+        ycbcr = color.rgb2ycbcr(np.array(img)) / 255.0
+
+        # project this image onto cluster-c PCA
+        means = self.cluster_means[cid].astype(np.float32)    # (3, D)
+        comps = self.cluster_pcas_raw[cid].astype(np.float32) # (3, K, D)
+        vecs  = [ycbcr[:, :, k].reshape(-1).astype(np.float32) for k in range(3)]
+        w = np.stack([(vecs[k] - means[k]).dot(comps[k].T) for k in range(3)], axis=0).astype(np.float32)  # (3,K)
+
+        # render current model (no grad) for this freq (forward_kpca_init is ZERO-MEAN)
+        self.gaussian_model.set_cluster_and_proj(cid, w)
+        self.gaussian_model.image_mean = torch.from_numpy(means).to(self.device).float()  # set mean for this cluster
+        self.gaussian_model.cur_freq = freq
+        with torch.no_grad():
+            pred_ycbcr_zm = self.gaussian_model.forward_kpca_init()  # (3,H,W), zero-mean
+            # add mean back and clamp to [0,1]
+            pred_ycbcr = (pred_ycbcr_zm.reshape(3, -1) + self.gaussian_model.image_mean).reshape(3, self.H, self.W)
+            pred_ycbcr = torch.clamp(pred_ycbcr, 0.0, 1.0)
+
+        # save side-by-side
+        rgb_pred = _ycbcr_to_rgb_uint8(pred_ycbcr)
+        rgb_gt   = np.array(img.convert("RGB"))
+        outdir = self.model_dir / "vis"
+        outdir.mkdir(parents=True, exist_ok=True)
+        _save_side_by_side(rgb_gt, rgb_pred, outdir / f"C{cid}_{freq}_{tag}_side_by_side.png")
+        self.logwriter.write(f"[Cluster {cid}] Saved C{cid}_{freq}_{tag}_side_by_side.png")
 
     # ---------- training (unchanged logic, but now per-cluster) ----------
     def train(self, freq: str):
@@ -209,34 +245,42 @@ class GaussianTrainer:
         progress_bar = tqdm(range(1, self.iterations+1), desc=f"C{self.active_cluster_id}:{freq} train")
         self.gaussian_model.train()
         start_time = time.time()
+
         for iter in range(1, self.iterations+1):
             loss, psnr = self.gaussian_model.train_iter(self.gt_arrs)
             with torch.no_grad():
-                progress_bar.set_postfix({f"Loss":f"{loss.item():.{7}f}", "PSNR":f"{psnr:.{4}f},"})
-                progress_bar.update(1)
-        
+                if iter % 10 == 0:
+                    progress_bar.set_postfix({f"Loss":f"{loss.item():.{7}f}", "PSNR":f"{psnr:.{4}f},"})
+                    progress_bar.update(10)
+
+                # NEW: periodic validation on the component stack (cheap, no side effects)
+                if iter % self.val_every == 0 or iter == self.iterations:
+                    self.test_freq()  # logs PSNR/MS-SSIM for current freq block
+                    # optional: save a mid-training side-by-side snapshot for this cluster
+                    self._save_cluster_stage_sxs(self.active_cluster_id, freq, tag=f"iter{iter}")
+
         end_time = time.time() - start_time
         progress_bar.close()
         self.logwriter.write(f"[Cluster {self.active_cluster_id}] {freq}-training Complete in {end_time:.4f}s")
+
+        # Final eval + final side-by-side for this cluster
         self.test_freq()
+        self._save_cluster_stage_sxs(self.active_cluster_id, freq, tag="final")
+
+        # NEW: save a checkpoint for this cluster/freq
+        ckpt_path = self.model_dir / f"C{self.active_cluster_id}_{freq}.pth.tar"
+        torch.save({"model_state_dict": self.gaussian_model.state_dict()}, ckpt_path)
+        self.logwriter.write(f"[Cluster {self.active_cluster_id}] Saved checkpoint: {ckpt_path.name}")
         return
+
 
     def train_all_clusters(self):
         for cid in range(self.num_clusters):
-            self._prepare_gt_arrs_for_cluster(cid)
-            self._set_active_cluster(cid)
-
-            low_cnt  = self.freq_config["low"][1]  - self.freq_config["low"][0]
-            high_cnt = self.freq_config["high"][1] - self.freq_config["high"][0]
-            high_pts = self.freq_config["high"][2]
-
-            if low_cnt > 0:
-                self.train(freq="low")
-            if high_cnt > 0 and high_pts > 0:
-                self.train(freq="high")
-
-        self.merge_freq()
+            self._prepare_gt_arrs_for_cluster(cid)   # (K,3,H,W) for this cluster
+            self._set_active_cluster(cid)            # tells the model which cluster we’re on
+            self.train(freq="all")                   # <— one phase, regular training
         return
+
 
     def merge_freq(self):
         # merge geometry (unchanged)
@@ -320,25 +364,37 @@ class GaussianTrainer:
         self.logwriter.write(f"[Cluster {self.active_cluster_id}] Components Fitting: PSNR:{psnr:.4f}, MS_SSIM:{ms_ssim_value:.6f}")
         return
 
+    def test_freq(self):
+        config = self.freq_config[self.gaussian_model.cur_freq]
+        gt_arrs = self.gt_arrs[config[0]:config[1], :, :, :]   # slice to match model output
+        self.gaussian_model.eval()
+        with torch.no_grad():
+            image = self.gaussian_model()  # (K_block, 3, H, W)
+        mse_loss = F.mse_loss(image.float(), gt_arrs.float())
+        psnr = 10 * math.log10(1.0 / mse_loss.item())
+        ms_ssim_value = ms_ssim_robust(image.float(), gt_arrs.float()).item()  # <-- use gt_arrs
+        self.logwriter.write(f"[Cluster {self.active_cluster_id}] Components Fitting: PSNR:{psnr:.4f}, MS_SSIM:{ms_ssim_value:.6f}")
+        return
+
     def vis(self):
         self.gaussian_model.eval()
         with torch.no_grad():
             image = self.gaussian_model()
-        mse_loss = F.mse_loss(image.float(), self.gt_arrs.float())
+        config = self.freq_config[self.gaussian_model.cur_freq]
+        gt_arrs = self.gt_arrs[config[0]:config[1], :, :, :]   # slice to match
+        mse_loss = F.mse_loss(image.float(), gt_arrs.float())
         psnr = 10 * math.log10(1.0 / mse_loss.item())
-        ms_ssim_value = ms_ssim_robust(image.float(), self.gt_arrs.float()).item()
+        ms_ssim_value = ms_ssim_robust(image.float(), gt_arrs.float()).item()
         self.logwriter.write(f"[Cluster {self.active_cluster_id}] Components Fitting: PSNR:{psnr:.4f}, MS_SSIM:{ms_ssim_value:.6f}")
-        
-        vis_dir = self.model_dir / f"vis_comps"
+
+        vis_dir = self.model_dir / "vis_comps"
         vis_dir.mkdir(parents=True, exist_ok=True)
-        transform = transforms.ToPILImage()
-        array = image.float()
-        for i in range(array.shape[0]):
-            for j in range(array.shape[1]):
-                img = transform(array[i, j])
-                img.save(vis_dir / f"C{self.active_cluster_id}_{i}-{j}.png")
-        
+        to_img = transforms.ToPILImage()
+        for i in range(image.shape[0]):
+            for j in range(image.shape[1]):
+                to_img(image[i, j]).save(vis_dir / f"C{self.active_cluster_id}_{i}-{j}.png")
         return psnr, ms_ssim_value
+
 
     def update_gaussian(self):
         """
@@ -396,8 +452,12 @@ class GaussianTrainer:
         Image.fromarray(rgb_img).save(vis_dir / f"kpca_init.png")
         self.logwriter.write(f"Init from cluster {cid} and saved vis/kpca_init.png")
         # --- also save side-by-side GT | kPCA-init ---
-        pred_init_ycbcr = self.gaussian_model.forward_kpca_init()   # (3,H,W) in [0,1]
+        pred_init_ycbcr = self.gaussian_model.forward_kpca_init()   # (3,H,W), zero-mean
+        # add mean and clamp to [0,1]
+        pred_init_ycbcr = (pred_init_ycbcr.reshape(3, -1) + self.gaussian_model.image_mean).reshape(3, self.H, self.W)
+        pred_init_ycbcr = torch.clamp(pred_init_ycbcr, 0.0, 1.0)
         rgb_pred = _ycbcr_to_rgb_uint8(pred_init_ycbcr)
+
         rgb_gt   = _ycbcr_to_rgb_uint8(self.gt_image)
         _save_side_by_side(rgb_gt, rgb_pred, self.model_dir / "vis" / "kpca_init_side_by_side.png")
 
