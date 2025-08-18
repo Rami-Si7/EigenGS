@@ -322,13 +322,96 @@ def prepare_clustered_arrs(args, output_dir):
         cluster_pcas.append(np.stack(comps_per_channel))  # (3, n_comps, D)
         norm_infos.append(norm_info_per_channel)
 
+
+# --- keep everything above as-is ---
+
     cluster_pcas = np.stack(cluster_pcas)  # (k, 3, n_comps, D)
 
-    # ✅ Save outputs
+    # ✅ Save existing outputs (unchanged)
     np.save(output_dir / "cluster_ids.npy", cluster_ids)
     np.save(output_dir / "cluster_pcas.npy", cluster_pcas)
     with open(output_dir / "norm_infos.pkl", "wb") as fout:
         pickle.dump(norm_infos, fout)
+
+    # ===== NEW: Save raw PCA components, means, EV/EVR, sizes, kmeans, metadata =====
+    # We recompute light-weight stats while we still have pca objects in-scope
+    # To avoid touching your existing logic above, we compute raw artifacts again cleanly.
+
+    # Re-run per-cluster per-channel PCA to collect RAW comps & means (no normalization)
+    print("🔎 Collecting raw PCA components/means/variance per cluster (added artifacts).")
+    cluster_pcas_raw = []
+    cluster_means = []
+    cluster_expl_var = []
+    cluster_expl_var_ratio = []
+    cluster_sizes = []
+
+    for c in range(args.k_clusters):
+        indices = np.where(cluster_ids == c)[0]
+        cluster_sizes.append(len(indices))
+
+        comps_raw_per_ch = []
+        means_per_ch = []
+        ev_per_ch = []
+        evr_per_ch = []
+
+        if len(indices) < args.n_comps:
+            # keep shapes consistent
+            D = Y.shape[1]
+            comps_raw_per_ch = [np.zeros((args.n_comps, D), dtype=np.float32) for _ in range(3)]
+            means_per_ch = [np.zeros((D,), dtype=np.float32) for _ in range(3)]
+            ev_per_ch = [np.zeros((args.n_comps,), dtype=np.float32) for _ in range(3)]
+            evr_per_ch = [np.zeros((args.n_comps,), dtype=np.float32) for _ in range(3)]
+        else:
+            for channel_data in [Y, Cb, Cr]:
+                data = channel_data[indices]  # (Nc, D)
+                pca = PCA(n_components=args.n_comps, whiten=False)
+                pca.fit(data)
+                comps_raw_per_ch.append(pca.components_.astype(np.float32))
+                means_per_ch.append(pca.mean_.astype(np.float32))
+                ev_per_ch.append(pca.explained_variance_.astype(np.float32))
+                evr_per_ch.append(pca.explained_variance_ratio_.astype(np.float32))
+
+        cluster_pcas_raw.append(np.stack(comps_raw_per_ch))      # (3, n_comps, D)
+        cluster_means.append(np.stack(means_per_ch))             # (3, D)
+        cluster_expl_var.append(np.stack(ev_per_ch))             # (3, n_comps)
+        cluster_expl_var_ratio.append(np.stack(evr_per_ch))      # (3, n_comps)
+
+    cluster_pcas_raw = np.stack(cluster_pcas_raw)                # (k, 3, n_comps, D)
+    cluster_means = np.stack(cluster_means)                      # (k, 3, D)
+    cluster_expl_var = np.stack(cluster_expl_var)                # (k, 3, n_comps)
+    cluster_expl_var_ratio = np.stack(cluster_expl_var_ratio)    # (k, 3, n_comps)
+
+    np.save(output_dir / "cluster_pcas_raw.npy", cluster_pcas_raw)
+    np.save(output_dir / "cluster_pca_means.npy", cluster_means)
+    np.save(output_dir / "cluster_explained_var.npy", cluster_expl_var)
+    np.save(output_dir / "cluster_explained_var_ratio.npy", cluster_expl_var_ratio)
+    np.save(output_dir / "cluster_sizes.npy", np.array(cluster_sizes, dtype=np.int32))
+
+    # Save KMeans model & training filenames for reproducibility
+    with open(output_dir / "kmeans.pkl", "wb") as f:
+        pickle.dump(kmeans, f)
+
+    with open(output_dir / "train_filenames.txt", "w") as f:
+        for p in img_list:
+            f.write(p.name + "\n")
+
+    # Metadata for sanity checking downstream
+    import json
+    meta = {
+        "img_size": list(map(int, args.img_size)),
+        "n_comps": int(args.n_comps),
+        "k_clusters": int(args.k_clusters),
+        "n_samples": int(n_samples),
+        "feature_dim_per_channel": int(Y.shape[1]),
+        "color_space": "YCbCr",
+        "channels_order": ["Y", "Cb", "Cr"],
+        "cluster_pcas_note": "cluster_pcas.npy are min-max normalized comps for viz; use cluster_pcas_raw.npy for math.",
+    }
+    with open(output_dir / "metadata.json", "w") as f:
+        json.dump(meta, f, indent=2)
+
+    print("✅ Saved additional raw PCA artifacts, KMeans model, sizes, and metadata.")
+
 
     print("✅ Saved clustered PCA components per channel.")
 if __name__ == "__main__":
