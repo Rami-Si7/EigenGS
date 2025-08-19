@@ -414,6 +414,37 @@ def prepare_clustered_arrs(args, output_dir):
 
 
     print("✅ Saved clustered PCA components per channel.")
+    # ===== NEW: Compute and save per-image PCA weights per channel =====
+    # For each cluster c, fit PCA per channel on that cluster's data exactly as before,
+    # then transform ALL images in that cluster to get their scores (weights).
+
+    print("🧮 Computing per-image PCA scores (weights) per channel...")
+    weights_Y = np.zeros((n_samples, args.n_comps), dtype=np.float32)
+    weights_Cb = np.zeros((n_samples, args.n_comps), dtype=np.float32)
+    weights_Cr = np.zeros((n_samples, args.n_comps), dtype=np.float32)
+
+    for c in range(args.k_clusters):
+        indices = np.where(cluster_ids == c)[0]
+        if len(indices) < args.n_comps:
+            continue  # leave zeros; you also stored zeros for empty/small clusters
+
+        # For each channel, refit PCA on the cluster and transform cluster members
+        for chan_name, DATA, W in [
+            ("Y",  Y,  weights_Y),
+            ("Cb", Cb, weights_Cb),
+            ("Cr", Cr, weights_Cr),
+        ]:
+            data_c = DATA[indices]  # (Nc, D), already in [0,1] since we divided by 255 above
+            pca = PCA(n_components=args.n_comps, whiten=False)
+            Z = pca.fit_transform(data_c)  # (Nc, C) scores
+            W[indices] = Z.astype(np.float32)
+
+    # Save as a single file for convenience
+    np.savez(output_dir / "cluster_pca_weights_per_image.npz",
+             weights_Y=weights_Y, weights_Cb=weights_Cb, weights_Cr=weights_Cr,
+             cluster_ids=cluster_ids)
+    print("✅ Saved per-image PCA weights (Y/Cb/Cr) and cluster_ids in NPZ.")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Parse image set")
     parser.add_argument("-s", "--source", required=True, type=Path)
