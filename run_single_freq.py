@@ -39,6 +39,7 @@ class GaussianTrainer:
         self.W, self.H = int(meta["img_size"][0]), int(meta["img_size"][1])  # img_size saved as [width, height]
         self.num_comps = int(meta["n_comps"])
         self.num_clusters = int(meta["k_clusters"])
+        self.comp_batch = int(getattr(args, "comp_batch", 0) or 0)
 
         # raw PCA components per cluster (K, 3, C, D), means per cluster (K, 3, D)
         self.cluster_pcas_raw = np.load(self.dataset_path / "cluster_pcas_raw.npy")   # (K, 3, C, D)
@@ -130,6 +131,87 @@ class GaussianTrainer:
         # optional quick viz of cluster 0
         self.vis(cluster_id=0)
         return
+    # def train(self):
+    #     """
+    #     Phase-A: Train per-cluster bases by accumulating gradients over *all* clusters
+    #     (and optionally over component chunks) in each iteration, then doing one step.
+    #     """
+    #     self.gaussian_model.train()
+    #     progress_bar = tqdm(range(1, self.iterations + 1), desc="Training (Phase-A, all clusters)")
+
+    #     # How many component chunks per cluster?
+    #     if self.comp_batch and self.comp_batch > 0 and self.comp_batch < self.num_comps:
+    #         n_chunks = (self.num_comps + self.comp_batch - 1) // self.comp_batch
+    #         chunk_ranges = [range(s, min(s + self.comp_batch, self.num_comps))
+    #                         for s in range(0, self.num_comps, self.comp_batch)]
+    #     else:
+    #         n_chunks = 1
+    #         chunk_ranges = [range(self.num_comps)]  # one chunk: all components
+
+    #     K = self.num_clusters
+    #     N_accum = K * n_chunks  # scale each partial loss to keep LR behavior stable
+
+    #     start_time = time.time()
+    #     for it in range(1, self.iterations + 1):
+    #         self.gaussian_model.optimizer.zero_grad(set_to_none=True)
+
+    #         total_loss_val = 0.0
+    #         sse = 0.0  # sum of squared errors for PSNR over all clusters/chunks rendered
+    #         n_pix = 0  # total number of pixels*channels contributing to sse
+
+    #         for k in range(K):
+    #             # Ground-truth component stack for this cluster (C,3,H,W) as torch on device
+    #             gt_stack_full = self._get_cluster_target_stack(k)
+
+    #             # Optionally iterate in component chunks to save VRAM
+    #             for comp_inds in chunk_ranges:
+    #                 # Forward only these components
+    #                 pred_stack = self.gaussian_model.forward(
+    #                     cluster_id=k, render_colors=False, comp_indices=comp_inds
+    #                 )  # (len(comp_inds), 3, H, W)
+
+    #                 gt_chunk = gt_stack_full[comp_inds]  # match shape
+
+    #                 # Loss for this (cluster, chunk)
+    #                 loss_chunk = loss_fn(pred_stack, gt_chunk, self.gaussian_model.loss_type, lambda_value=0.7)
+
+    #                 # Scale so that the sum over all chunks & clusters ~ same magnitude each iter
+    #                 loss_scaled = loss_chunk / float(N_accum)
+    #                 loss_scaled.backward()
+
+    #                 total_loss_val += float(loss_chunk.detach().item())
+
+    #                 # accumulate SSE for PSNR (use reduction='sum' to get SSE)
+    #                 with torch.no_grad():
+    #                     sse += float(F.mse_loss(pred_stack, gt_chunk, reduction='sum').item())
+    #                     n_pix += pred_stack.numel()
+
+    #         # One optimizer step per iteration, after accumulating across all clusters/chunks
+    #         self.gaussian_model.optimizer.step()
+    #         self.gaussian_model.scheduler.step()
+
+    #         # PSNR over everything rendered this iter
+    #         psnr = 10.0 * math.log10(1.0 / (sse / (n_pix + 1e-12) + 1e-12))
+
+    #         # UI
+    #         progress_bar.set_postfix({
+    #             "Loss(sum)": f"{total_loss_val:.7f}",
+    #             "PSNR(avg)": f"{psnr:.4f},",
+    #             "K": f"{K}",
+    #             "chunks/cluster": f"{n_chunks}",
+    #         })
+    #         progress_bar.update(1)
+
+    #     end_time = time.time() - start_time
+    #     progress_bar.close()
+    #     self.logwriter.write("Phase-A Training Complete in {:.4f}s".format(end_time))
+
+    #     torch.save({'model_state_dict': self.gaussian_model.state_dict()},
+    #               self.model_dir / "gaussian_model_phaseA.pth.tar")
+
+    #     # Optional quick viz of a cluster
+    #     self.vis(cluster_id=0)
+    #     return
 
     def _predict_cluster_id_for_image(self, img_tensor_3xHxW: torch.Tensor) -> int:
         """
@@ -282,6 +364,10 @@ def parse_args(argv):
     )
     parser.add_argument(
         "--num_points", type=int, default=50000, help="2D GS points"
+    )
+    parser.add_argument(
+    "--comp_batch", type=int, default=0,
+    help="Number of components per forward/backward (0=all components). Use to limit VRAM."
     )
     parser.add_argument("--model_path", type=str, default=None, help="Path to a checkpoint")
     parser.add_argument("--image_path", type=str, default=None, help="Path to a single image for Phase-B")
