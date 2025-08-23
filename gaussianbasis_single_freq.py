@@ -259,8 +259,8 @@ class GaussianBasis(nn.Module):
 
         # Debug print (one line) so you *know* what's trainable
         n_params = sum(p.numel() for p in params)
-        print(f"[scheduler_init phase {phase}] params={len(params)} (total scalars {n_params}), "
-              f"features_grad={self._features_dc.requires_grad}, "
-              f"colors_grad={self._colors.requires_grad}, "
-              f"xyz_grad={self._xyz.requires_grad}, chol_grad={self._cholesky.requires_grad}")
+        # print(f"[scheduler_init phase {phase}] params={len(params)} (total scalars {n_params}), "
+        #       f"features_grad={self._features_dc.requires_grad}, "
+        #       f"colors_grad={self._colors.requires_grad}, "
+        #       f"xyz_grad={self._xyz.requires_grad}, chol_grad={self._cholesky.requires_grad}")
 
