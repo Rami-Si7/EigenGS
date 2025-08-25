@@ -369,6 +369,7 @@ class GaussianTrainer:
             norm_infos = pickle.load(FIN)
 
         # load image
+        print(img_path)
         gt_img = self._load_ycbcr_tensor(img_path)  # (3,H,W)
         img_arr = gt_img.detach().cpu().numpy().reshape(3, -1)
 
