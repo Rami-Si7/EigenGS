@@ -60,6 +60,20 @@ class GaussianBasis(nn.Module):
     def get_cholesky_elements(self):
         return self._cholesky+self.cholesky_bound
 
+    # def _forward_colors(self):
+    #     self.xys, depths, self.radii, conics, num_tiles_hit = project_gaussians_2d(
+    #         self.get_xyz, self.get_cholesky_elements, 
+    #         self.H, self.W, self.tile_bounds
+    #     )
+    #     out_img = rasterize_gaussians_sum(
+    #         self.xys, depths, self.radii, conics, num_tiles_hit,
+    #         self.get_colors, self._opacity, self.H, self.W, self.BLOCK_H, self.BLOCK_W,
+    #         background=self.background, return_alpha=False
+    #     )
+    #     out_img *= self.scale_factor
+    #     out_img += self.shift_factor
+    #     out_img = out_img.permute(2, 0, 1).contiguous()
+    #     return out_img
     def _forward_colors(self):
         self.xys, depths, self.radii, conics, num_tiles_hit = project_gaussians_2d(
             self.get_xyz, self.get_cholesky_elements, 
@@ -70,11 +84,11 @@ class GaussianBasis(nn.Module):
             self.get_colors, self._opacity, self.H, self.W, self.BLOCK_H, self.BLOCK_W,
             background=self.background, return_alpha=False
         )
-        out_img *= self.scale_factor
-        out_img += self.shift_factor
         out_img = out_img.permute(2, 0, 1).contiguous()
-        return out_img
 
+        out_img = out_img * self.scale_factor.view(3,1,1)        # CHW-safe
+        out_img = out_img + self.shift_factor.view(3,1,1)
+        return out_img
     # def _forward_featrues_dc(self):
     #     self.xys, depths, self.radii, conics, num_tiles_hit = project_gaussians_2d(
     #         self.get_xyz, self.get_cholesky_elements, 
