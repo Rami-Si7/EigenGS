@@ -3,9 +3,8 @@ import numpy as np
 from skimage import color
 from pathlib import Path
 from PIL import Image
-import pickle
 import argparse
-from tqdm import trange
+from tqdm import tqdm
 import uuid
 import json
 import time
@@ -17,43 +16,30 @@ from torch import Tensor
 from projective_clustering_gpu import EMLikeAlg, assign_points
 
 # --------------------------- helpers ---------------------------
+def load_ycbcr_from_paths(img_paths, img_size: tuple[int,int]):
+    """Given a list of paths, load/resize and return Y,Cb,Cr and the (possibly re-ordered) paths."""
+    W, H = img_size
+    N = len(img_paths)
+    d = W * H
+    Y  = np.empty((N, d), dtype=np.float32)
+    Cb = np.empty((N, d), dtype=np.float32)
+    Cr = np.empty((N, d), dtype=np.float32)
 
-def visualize(output_dir: Path):
-    vis_dir = output_dir / "vis"
-    vis_dir.mkdir(parents=True, exist_ok=True)
-    array = np.load(output_dir / "arrs.npy")      # (K*J, 3, H, W) in [0,1]
-    for i in range(array.shape[0]):
-        for j in range(array.shape[1]):
-            img = (array[i, j] * 255.0).clip(0, 255).astype(np.uint8)
-            Image.fromarray(img, mode="L").save(vis_dir / f"{i:04d}-{j}.png")
+    for i, fp in enumerate(tqdm(img_paths, desc="Load + resize + RGB->YCbCr")):
+        img = Image.open(fp).convert("RGB")
+        img = img.resize((W, H), Image.Resampling.LANCZOS)
+        arr = np.asarray(img, dtype=np.uint8)
+        ycbcr = color.rgb2ycbcr(arr).astype(np.float32) / 255.0
+        y, cb, cr = ycbcr[..., 0], ycbcr[..., 1], ycbcr[..., 2]
+        Y[i]  = y.reshape(-1)
+        Cb[i] = cb.reshape(-1)
+        Cr[i] = cr.reshape(-1)
+    return Y, Cb, Cr, img_paths
 
-def prepare_imgs(args, output_dir: Path):
-    train_dir = output_dir / "train_imgs"
-    test_dir  = output_dir / "test_imgs"
-    train_dir.mkdir(parents=True, exist_ok=True)
-    test_dir.mkdir(parents=True, exist_ok=True)
-
-    img_list = sorted([f for f in args.source.glob("*.png")])
-    n_samples = min(args.n_samples, len(img_list))
-    n_test    = min(args.n_samples + args.n_test, len(img_list))
-
-    c = 0
-    for i in trange(n_samples, desc="Prepare training images"):
-        img = Image.open(img_list[i*2]).convert("RGB")
-        img = img.resize((args.img_size[0], args.img_size[1]), Image.Resampling.LANCZOS)
-        img.save(train_dir / f"{c:03d}.png")
-        c += 1
-
-    c = 0
-    for i in trange(n_samples, n_test, desc="Prepare testing images"):
-        img = Image.open(img_list[i*2]).convert("RGB")
-        img = img.resize((args.img_size[0], args.img_size[1]), Image.Resampling.LANCZOS)
-        img.save(test_dir / f"{c:03d}.png")
-        c += 1
-
-def load_ycbcr_matrix(train_dir: Path, img_size: tuple[int,int]):
-    img_list = sorted([f for f in train_dir.glob("*.png")])
-    N = len(img_list)
+def load_ycbcr_from_source(src_dir: Path, img_size: tuple[int,int]):
+    """Load ALL *.png from source, resize to (W,H), return Y,Cb,Cr matrices and the file list."""
+    img_paths = sorted([f for f in src_dir.glob("*.png")])
+    N = len(img_paths)
     W, H = img_size
     d = W * H
 
@@ -61,15 +47,16 @@ def load_ycbcr_matrix(train_dir: Path, img_size: tuple[int,int]):
     Cb = np.empty((N, d), dtype=np.float32)
     Cr = np.empty((N, d), dtype=np.float32)
 
-    for i, fp in enumerate(img_list):
+    for i, fp in enumerate(tqdm(img_paths, desc="Load + resize + RGB->YCbCr")):
         img = Image.open(fp).convert("RGB")
+        img = img.resize((W, H), Image.Resampling.LANCZOS)
         arr = np.asarray(img, dtype=np.uint8)
         ycbcr = color.rgb2ycbcr(arr).astype(np.float32) / 255.0  # [0,1]
         y, cb, cr = ycbcr[..., 0], ycbcr[..., 1], ycbcr[..., 2]
         Y[i]  = y.reshape(-1)
         Cb[i] = cb.reshape(-1)
         Cr[i] = cr.reshape(-1)
-    return Y, Cb, Cr
+    return Y, Cb, Cr, img_paths
 
 @torch.no_grad()
 def pca_topJ_torch(X: Tensor, J: int) -> Tensor:
@@ -89,6 +76,23 @@ def pca_topJ_torch(X: Tensor, J: int) -> Tensor:
         pad = torch.zeros((J - Juse, X.shape[1]), device=device, dtype=dtype)
         top = torch.cat([top, pad], dim=0)
     return top.contiguous()  # (J,d)
+
+def compute_channel_norms(bases: torch.Tensor):
+    """Global per-channel mins/maxs used for consistent visualization scaling."""
+    mins = bases.amin(dim=(0,2,3)).cpu().numpy()  # (3,)
+    maxs = bases.amax(dim=(0,2,3)).cpu().numpy()  # (3,)
+    den = (maxs - mins).copy()
+    den[den == 0] = 1.0
+    return mins, maxs, den
+
+def visualize(output_dir: Path):
+    vis_dir = output_dir / "vis"
+    vis_dir.mkdir(parents=True, exist_ok=True)
+    array = np.load(output_dir / "arrs.npy")      # (K*J, 3, H, W) in [0,1]
+    for i in range(array.shape[0]):
+        for j in range(array.shape[1]):
+            img = (array[i, j] * 255.0).clip(0, 255).astype(np.uint8)
+            Image.fromarray(img, mode="L").save(vis_dir / f"{i:04d}-{j}.png")
 
 def build_arrs_and_save(output_dir: Path,
                         means: torch.Tensor,      # (K,3,d)
@@ -128,30 +132,17 @@ def build_arrs_and_save(output_dir: Path,
 
     return mins, maxs
 
-    
-def compute_channel_norms(bases: torch.Tensor):
-    """Global per-channel mins/maxs used for consistent visualization scaling."""
-    mins = bases.amin(dim=(0,2,3)).cpu().numpy()  # (3,)
-    maxs = bases.amax(dim=(0,2,3)).cpu().numpy()  # (3,)
-    den = (maxs - mins).copy()
-    den[den == 0] = 1.0
-    return mins, maxs, den
-
 def save_clusters(outdir: Path,
-                  assign: np.ndarray,       # (N,)
-                  Vs_np: np.ndarray,         # (K, J, d)  (Y-channel flats from EM)
-                  vs_np: np.ndarray,         # (K, d)
-                  means: torch.Tensor,       # (K, 3, d)
-                  bases: torch.Tensor,       # (K, 3, J, d)
+                  assign: np.ndarray,         # (N,)
+                  train_idxs_per_k: dict,     # k -> np.ndarray
+                  test_idxs_per_k: dict,      # k -> np.ndarray
+                  Vs_np: np.ndarray,          # (K, J, d)
+                  vs_np: np.ndarray,          # (K, d)
+                  means: torch.Tensor,        # (K, 3, d)
+                  bases: torch.Tensor,        # (K, 3, J, d)
                   img_size: tuple[int,int]):
     """
-    Create clusters/cluster_XX folders with:
-      - indices.npy                 (training indices in this cluster)
-      - Y_flat_V.npy, Y_flat_v.npy  (affine J-flat for Y channel from EM)
-      - means.npy   (3,d), bases.npy (3,J,d)  per-channel PCA within cluster
-      - arrs.npy    (J,3,H,W) normalized with GLOBAL per-channel min/max
-      - meta.json   (all shapes, norms, image size)
-      - vis/*.png   quick grayscale previews per channel component
+    Write cluster artifacts and split indices to outdir/clusters/cluster_XX.
     """
     W, H = img_size
     K, three, J, d = bases.shape
@@ -165,21 +156,21 @@ def save_clusters(outdir: Path,
         cdir = clusters_dir / f"cluster_{k:02d}"
         (cdir / "vis").mkdir(parents=True, exist_ok=True)
 
-        # 1) membership
-        idxs = np.where(assign == k)[0]
-        np.save(cdir / "indices.npy", idxs)
+        # split indices
+        np.save(cdir / "train_indices.npy", train_idxs_per_k[k])
+        np.save(cdir / "test_indices.npy",  test_idxs_per_k[k])
 
-        # 2) Y-channel affine flat from EM (row-basis + translation)
+        # Y-channel affine flat from EM (row-basis + translation)
         np.save(cdir / "Y_flat_V.npy", Vs_np[k])  # (J,d)
         np.save(cdir / "Y_flat_v.npy", vs_np[k])  # (d,)
 
-        # 3) per-channel means + bases (from your per-cluster PCA step)
+        # per-channel means + bases (from per-cluster PCA on TRAIN set)
         means_k = means[k].detach().cpu().numpy()        # (3,d)
         bases_k = bases[k].detach().cpu().numpy()        # (3,J,d)
         np.save(cdir / "means.npy", means_k)
         np.save(cdir / "bases.npy", bases_k)
 
-        # 4) normalized “eigenimages” for this cluster only (J,3,H,W)
+        # normalized eigenimages for this cluster only (J,3,H,W)
         vis_list = []
         for j in range(J):
             trip = []
@@ -188,7 +179,6 @@ def save_clusters(outdir: Path,
                 v01 = (v - mins[ch]) / den[ch]
                 v01 = np.clip(v01, 0.0, 1.0)
                 trip.append(v01[None, ...])   # (1,H,W)
-                # quick per-channel png
                 Image.fromarray((v01*255.0).astype(np.uint8), mode="L").save(
                     cdir / "vis" / f"{j:03d}-ch{ch}.png"
                 )
@@ -196,63 +186,144 @@ def save_clusters(outdir: Path,
         arrs_k = np.stack(vis_list, axis=0)  # (J,3,H,W)
         np.save(cdir / "arrs.npy", arrs_k)
 
-        # 5) metadata
+        # metadata
+        idxs_all = np.where(assign == k)[0]
         meta = {
             "cluster": int(k),
-            "num_members": int(idxs.size),
+            "num_members": int(idxs_all.size),
+            "num_train": int(train_idxs_per_k[k].size),
+            "num_test": int(test_idxs_per_k[k].size),
             "img_size": [W, H],
             "J": int(J),
             "d": int(d),
             "norm_mins": mins.tolist(),
             "norm_maxs": maxs.tolist(),
-            "files": ["indices.npy", "Y_flat_V.npy", "Y_flat_v.npy",
+            "files": ["train_indices.npy", "test_indices.npy",
+                      "Y_flat_V.npy", "Y_flat_v.npy",
                       "means.npy", "bases.npy", "arrs.npy"],
         }
         with open(cdir / "meta.json", "w") as f:
             json.dump(meta, f, indent=2)
 
+def save_split_images(img_paths, train_idxs_per_k, test_idxs_per_k, outdir: Path, img_size: tuple[int,int]):
+    """
+    Save resized copies per-cluster (train/test) AND aggregated all_train/all_test.
+    """
+    W, H = img_size
+    # global folders
+    all_train_dir = outdir / "all_train"
+    all_test_dir  = outdir / "all_test"
+    all_train_dir.mkdir(parents=True, exist_ok=True)
+    all_test_dir.mkdir(parents=True, exist_ok=True)
+
+    # per-cluster folders
+    for k in train_idxs_per_k.keys():
+        (outdir / "clusters" / f"cluster_{k:02d}" / "train_imgs").mkdir(parents=True, exist_ok=True)
+        (outdir / "clusters" / f"cluster_{k:02d}" / "test_imgs").mkdir(parents=True, exist_ok=True)
+
+    # save helper
+    def _save(idx, dest_dir: Path, k: int):
+        fp = img_paths[idx]
+        img = Image.open(fp).convert("RGB")
+        img = img.resize((W, H), Image.Resampling.LANCZOS)
+        name = f"{k:02d}_{idx:06d}.png"  # cluster-prefixed, unique
+        img.save(dest_dir / name)
+
+    # write per-cluster + aggregated
+    for k, idxs in train_idxs_per_k.items():
+        ctrain = outdir / "clusters" / f"cluster_{k:02d}" / "train_imgs"
+        for idx in tqdm(idxs, desc=f"Save cluster {k} train", leave=False):
+            _save(int(idx), ctrain, k)
+            _save(int(idx), all_train_dir, k)
+
+    for k, idxs in test_idxs_per_k.items():
+        ctest = outdir / "clusters" / f"cluster_{k:02d}" / "test_imgs"
+        for idx in tqdm(idxs, desc=f"Save cluster {k} test", leave=False):
+            _save(int(idx), ctest, k)
+            _save(int(idx), all_test_dir, k)
+
 # --------------------------- main ---------------------------
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Parse image set with EM-like (K,J)-flats on GPU")
+    ap = argparse.ArgumentParser(description="Parse image set with EM-like (K,J)-flats on GPU (cluster -> split -> save)")
     ap.add_argument("-s", "--source", required=True, type=Path, help="Folder with *.png")
     ap.add_argument("-K", "--K_clusters", type=int, default=6, help="number of clusters")
     ap.add_argument("-J", "--J_dim", type=int, default=50, help="flat dimension per cluster")
-    ap.add_argument("-n", "--n_samples", type=int, default=10000)
-    ap.add_argument("-t", "--n_test", type=int, default=100)
     ap.add_argument("--steps", type=int, default=20, help="EM steps")
-    ap.add_argument("--inits", type=int, default=10, help="random initializations")
-    ap.add_argument("--img_size", type=int, nargs=2, default=[512, 512],
-                    metavar=('width','height'))
+    ap.add_argument("--inits", type=int, default=10, help="random inits (set inside GPU module if needed)")
+    ap.add_argument("--img_size", type=int, nargs=2, default=[512, 512], metavar=('width','height'))
+    ap.add_argument("--test_frac", type=float, default=0.1, help="fraction per cluster to reserve for test")
+    ap.add_argument("--max_samples", type=int, default=29496,
+                help="If >0, randomly pick this many images from source before EM (default: 29496)")
+    ap.add_argument("--sample_seed", type=int, default=0,
+                help="Random seed for sampling (default: 0)")
+
     args = ap.parse_args()
 
     outdir = args.source.parent / f"{str(uuid.uuid4())[:6]}-K{args.K_clusters}-J{args.J_dim}"
     outdir.mkdir(parents=True, exist_ok=True)
 
-    print("== [1/5] Preparing resized train/test images ==")
+    # == [1/5] Loading and converting images ==
+    print("== [1/5] Loading and converting images ==")
     t0 = time.time()
-    prepare_imgs(args, outdir)
-    print(f"done in {time.time()-t0:.2f}s")
+    W, H = args.img_size
 
-    print("== [2/5] Loading YCbCr (flattened) ==")
-    t0 = time.time()
-    train_dir = outdir / "train_imgs"
-    Y, Cb, Cr = load_ycbcr_matrix(train_dir, tuple(args.img_size))
-    print(f"done in {time.time()-t0:.2f}s | Y={Y.shape} Cb={Cb.shape} Cr={Cr.shape}")
+    all_paths = sorted([f for f in args.source.glob("*.png")])
+    M = args.max_samples
+    if M > 0 and M < len(all_paths):
+        rng = np.random.default_rng(args.sample_seed)
+        sel = rng.choice(len(all_paths), size=M, replace=False)
+        # keep a stable order for filenames/splits
+        img_paths = [all_paths[i] for i in sorted(sel.tolist())]
+    else:
+        img_paths = all_paths
 
-    # --- EM-like clustering on Y (GPU) ---
-    print("== [3/5] EM-like clustering on Y (GPU) ==")
-    t0 = time.time()
+    Y, Cb, Cr, img_paths = load_ycbcr_from_paths(img_paths, (W, H))
     N = Y.shape[0]
-    w = np.ones((N,), dtype=np.float32)
-    Vs, vs, _ = EMLikeAlg(Y, w, j=args.J_dim, k=args.K_clusters, steps=args.steps)
-    assign = assign_points(Y, w, Vs, vs)         # (N,)
-    sizes = np.bincount(assign, minlength=args.K_clusters)
-    print(f"done in {time.time()-t0:.2f}s | sizes={sizes.tolist()}")
+    print(f"done in {time.time()-t0:.2f}s | picked N={N}/{len(all_paths)} | vec dim d={Y.shape[1]}")
 
-    # --- Per-cluster, per-channel components on GPU ---
-    print("== [4/5] Per-cluster {Y,Cb,Cr} top-J components per cluster (GPU) ==")
+    # == [2/5] EM-like clustering on Y (GPU) ==
+    print("== [2/5] EM-like clustering on Y (GPU) ==")
+    t0 = time.time()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    Y_t = torch.as_tensor(Y, dtype=torch.float32, device=device)
+    Cb_t = torch.as_tensor(Cb, dtype=torch.float32, device=device)
+    Cr_t = torch.as_tensor(Cr, dtype=torch.float32, device=device)
+    w_t = torch.ones((N,), dtype=torch.float32, device=device)
+    Vs_t, vs_t, _ = EMLikeAlg(Y_t, Cb_t, Cr_t, w_t, j=args.J_dim, k=args.K_clusters, steps=args.steps)
+    assign_t = assign_points(Y_t, Cb_t, Cr_t, w_t, Vs_t, vs_t)
+    assign = assign_t.detach().cpu().numpy()
+    Vs = Vs_t.detach().cpu().numpy()
+    vs = vs_t.detach().cpu().numpy()
+    sizes = np.bincount(assign, minlength=args.K_clusters)
+    print(f"done in {time.time()-t0:.2f}s | cluster sizes={sizes.tolist()}")
+
+    # == [3/5] Split train/test per cluster ==
+    print("== [3/5] Split train/test per cluster ==")
+    rng = np.random.default_rng(0)
+    train_idxs_per_k = {}
+    test_idxs_per_k = {}
+    for k in range(args.K_clusters):
+        idxs = np.where(assign == k)[0]
+        if idxs.size == 0:
+            train_idxs_per_k[k] = np.array([], dtype=np.int64)
+            test_idxs_per_k[k]  = np.array([], dtype=np.int64)
+            continue
+        idxs = rng.permutation(idxs)
+        n_test = max(1, int(round(args.test_frac * idxs.size))) if idxs.size > 1 else 1
+        n_test = min(n_test, idxs.size)  # clamp
+        test_idxs = idxs[:n_test]
+        train_idxs = idxs[n_test:]
+        # if tiny cluster, allow empty train set
+        train_idxs_per_k[k] = train_idxs.astype(np.int64)
+        test_idxs_per_k[k]  = test_idxs.astype(np.int64)
+
+    # == [4/5] Save images per-cluster + aggregated ==
+    print("== [4/5] Saving images per cluster and aggregated train/test ==")
+    save_split_images(img_paths, train_idxs_per_k, test_idxs_per_k, outdir, (W, H))
+
+    # == [5/5] Per-cluster PCA on TRAIN members only ==
+    print("== [5/5] Per-cluster {Y,Cb,Cr} top-J components per cluster (TRAIN only, GPU) ==")
     Yt  = torch.as_tensor(Y,  dtype=torch.float32, device=device)
     Cbt = torch.as_tensor(Cb, dtype=torch.float32, device=device)
     Crt = torch.as_tensor(Cr, dtype=torch.float32, device=device)
@@ -260,16 +331,15 @@ if __name__ == "__main__":
     K = args.K_clusters
     J = args.J_dim
     d = Y.shape[1]
-
     means = torch.empty((K, 3, d), device=device, dtype=torch.float32)
     bases = torch.empty((K, 3, J, d), device=device, dtype=torch.float32)
 
     for k in range(K):
-        idxs = np.where(assign == k)[0]
-        if idxs.size == 0:
-            # fallback: pick a small random subset to avoid empty SVD
-            idxs = np.random.choice(N, size=max(J+2, 32), replace=False)
-        idx_t = torch.as_tensor(idxs, device=device)
+        tr = train_idxs_per_k[k]
+        if tr.size == 0:
+            # if no train in this cluster, borrow a small random subset from all data
+            tr = np.random.default_rng(1).choice(N, size=min(max(J+2, 32), N), replace=False)
+        idx_t = torch.as_tensor(tr, device=device)
 
         for ch, Xfull in enumerate([Yt, Cbt, Crt]):
             Xk = Xfull.index_select(0, idx_t)        # (n_c, d)
@@ -277,19 +347,25 @@ if __name__ == "__main__":
             comps = pca_topJ_torch(Xk, J)            # (J,d) row-vectors
             bases[k, ch] = comps
 
-    print("== [5/5] Saving arrs + basis ==")
-    build_arrs_and_save(outdir, means, bases, tuple(args.img_size))
-    save_clusters(outdir, assign, Vs, vs, means, bases, tuple(args.img_size))
-    # also save assignments + meta for inspection
-    np.save(outdir / "train_assignments.npy", assign)
+    # Save analysis artifacts + cluster metadata (incl. split indices)
+    build_arrs_and_save(outdir, means, bases, (W, H))
+    save_clusters(outdir, assign, train_idxs_per_k, test_idxs_per_k,
+                  Vs, vs, means, bases, (W, H))
+
+    # top-level meta
     with open(outdir / "meta.json", "w") as f:
         json.dump({
-            "img_size": list(args.img_size),
-            "K": args.K_clusters,
-            "J": args.J_dim,
-            "n_samples": int(args.n_samples),
-            "n_test": int(args.n_test),
-            "cluster_sizes": sizes.tolist()
+            "img_size": [W, H],
+            "K": K,
+            "J": J,
+            "N": int(N),
+            "cluster_sizes": sizes.tolist(),
+            "test_frac": float(args.test_frac),
+            "outdirs": {
+                "clusters": "clusters/cluster_xx/{train_imgs,test_imgs,...}",
+                "all_train": "all_train/",
+                "all_test": "all_test/"
+            }
         }, f, indent=2)
 
     print(f"== DONE. Artifacts in: {outdir} ==")
