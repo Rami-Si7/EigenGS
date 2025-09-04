@@ -136,21 +136,35 @@ def save_clusters(outdir: Path,
                   assign: np.ndarray,         # (N,)
                   train_idxs_per_k: dict,     # k -> np.ndarray
                   test_idxs_per_k: dict,      # k -> np.ndarray
-                  Vs_np: np.ndarray,          # (K, J, d)
-                  vs_np: np.ndarray,          # (K, d)
-                  means: torch.Tensor,        # (K, 3, d)
-                  bases: torch.Tensor,        # (K, 3, J, d)
+                  Vs_np: np.ndarray,          # (K,3,J,d)  or legacy (K,J,d)
+                  vs_np: np.ndarray,          # (K,3,d)    or legacy (K,d)
+                  means: torch.Tensor,        # (K,3,d)
+                  bases: torch.Tensor,        # (K,3,J,d)
                   img_size: tuple[int,int]):
     """
     Write cluster artifacts and split indices to outdir/clusters/cluster_XX.
+
+    Saves:
+      - train_indices.npy, test_indices.npy
+      - em_Vs.npy, em_vs.npy            (3,J,d) and (3,d)  [NEW if available]
+      - Y_flat_V.npy, Y_flat_v.npy      (J,d) and (d,)     [kept for compatibility]
+      - means.npy, bases.npy            (3,d) and (3,J,d)  (per-cluster PCA, TRAIN only)
+      - arrs.npy                        (J,3,H,W)          normalized eigenimages
+      - meta.json
     """
     W, H = img_size
     K, three, J, d = bases.shape
-    assert three == 3 and d == W*H
+    assert three == 3 and d == W * H
 
+    # normalize for visualization
     mins, maxs, den = compute_channel_norms(bases)
+
     clusters_dir = outdir / "clusters"
     clusters_dir.mkdir(parents=True, exist_ok=True)
+
+    # detect EM shapes (legacy single-channel vs multi-channel)
+    em_is_multi = (Vs_np.ndim == 4 and vs_np.ndim == 3)  # expect (K,3,J,d) and (K,3,d)
+    em_J = None
 
     for k in range(K):
         cdir = clusters_dir / f"cluster_{k:02d}"
@@ -160,17 +174,30 @@ def save_clusters(outdir: Path,
         np.save(cdir / "train_indices.npy", train_idxs_per_k[k])
         np.save(cdir / "test_indices.npy",  test_idxs_per_k[k])
 
-        # Y-channel affine flat from EM (row-basis + translation)
-        np.save(cdir / "Y_flat_V.npy", Vs_np[k])  # (J,d)
-        np.save(cdir / "Y_flat_v.npy", vs_np[k])  # (d,)
+        # ----- EM subspaces -----
+        if em_is_multi:
+            # full 3-channel EM flats
+            em_Vs_k = Vs_np[k]         # (3,J,d)
+            em_vs_k = vs_np[k]         # (3,d)
+            em_J = em_Vs_k.shape[1]
+            np.save(cdir / "em_Vs.npy", em_Vs_k)
+            np.save(cdir / "em_vs.npy", em_vs_k)
 
-        # per-channel means + bases (from per-cluster PCA on TRAIN set)
+            # backward-compat convenience (Y-channel slice)
+            np.save(cdir / "Y_flat_V.npy", em_Vs_k[0])   # (J,d)
+            np.save(cdir / "Y_flat_v.npy", em_vs_k[0])   # (d,)
+        else:
+            # legacy (Y-only EM)
+            np.save(cdir / "Y_flat_V.npy", Vs_np[k])     # (J,d)
+            np.save(cdir / "Y_flat_v.npy", vs_np[k])     # (d,)
+
+        # ----- per-cluster PCA (TRAIN only) -----
         means_k = means[k].detach().cpu().numpy()        # (3,d)
         bases_k = bases[k].detach().cpu().numpy()        # (3,J,d)
         np.save(cdir / "means.npy", means_k)
         np.save(cdir / "bases.npy", bases_k)
 
-        # normalized eigenimages for this cluster only (J,3,H,W)
+        # ----- normalized eigenimages for this cluster (J,3,H,W) -----
         vis_list = []
         for j in range(J):
             trip = []
@@ -179,15 +206,23 @@ def save_clusters(outdir: Path,
                 v01 = (v - mins[ch]) / den[ch]
                 v01 = np.clip(v01, 0.0, 1.0)
                 trip.append(v01[None, ...])   # (1,H,W)
-                Image.fromarray((v01*255.0).astype(np.uint8), mode="L").save(
+                Image.fromarray((v01 * 255.0).astype(np.uint8), mode="L").save(
                     cdir / "vis" / f"{j:03d}-ch{ch}.png"
                 )
             vis_list.append(np.concatenate(trip, axis=0))  # (3,H,W)
         arrs_k = np.stack(vis_list, axis=0)  # (J,3,H,W)
         np.save(cdir / "arrs.npy", arrs_k)
 
-        # metadata
+        # ----- metadata -----
         idxs_all = np.where(assign == k)[0]
+        files_list = [
+            "train_indices.npy", "test_indices.npy",
+            "Y_flat_V.npy", "Y_flat_v.npy",
+            "means.npy", "bases.npy", "arrs.npy"
+        ]
+        if em_is_multi:
+            files_list = ["em_Vs.npy", "em_vs.npy"] + files_list
+
         meta = {
             "cluster": int(k),
             "num_members": int(idxs_all.size),
@@ -196,14 +231,86 @@ def save_clusters(outdir: Path,
             "img_size": [W, H],
             "J": int(J),
             "d": int(d),
-            "norm_mins": mins.tolist(),
-            "norm_maxs": maxs.tolist(),
-            "files": ["train_indices.npy", "test_indices.npy",
-                      "Y_flat_V.npy", "Y_flat_v.npy",
-                      "means.npy", "bases.npy", "arrs.npy"],
+            "em_multi_channel": bool(em_is_multi),
+            "em_J": int(em_J if em_is_multi else J),
+            "norm_mins": [float(x) for x in mins.tolist()],
+            "norm_maxs": [float(x) for x in maxs.tolist()],
+            "files": files_list,
         }
         with open(cdir / "meta.json", "w") as f:
             json.dump(meta, f, indent=2)
+# def save_clusters(outdir: Path,
+#                   assign: np.ndarray,         # (N,)
+#                   train_idxs_per_k: dict,     # k -> np.ndarray
+#                   test_idxs_per_k: dict,      # k -> np.ndarray
+#                   Vs_np: np.ndarray,          # (K, J, d)
+#                   vs_np: np.ndarray,          # (K, d)
+#                   means: torch.Tensor,        # (K, 3, d)
+#                   bases: torch.Tensor,        # (K, 3, J, d)
+#                   img_size: tuple[int,int]):
+#     """
+#     Write cluster artifacts and split indices to outdir/clusters/cluster_XX.
+#     """
+#     W, H = img_size
+#     K, three, J, d = bases.shape
+#     assert three == 3 and d == W*H
+
+#     mins, maxs, den = compute_channel_norms(bases)
+#     clusters_dir = outdir / "clusters"
+#     clusters_dir.mkdir(parents=True, exist_ok=True)
+
+#     for k in range(K):
+#         cdir = clusters_dir / f"cluster_{k:02d}"
+#         (cdir / "vis").mkdir(parents=True, exist_ok=True)
+
+#         # split indices
+#         np.save(cdir / "train_indices.npy", train_idxs_per_k[k])
+#         np.save(cdir / "test_indices.npy",  test_idxs_per_k[k])
+
+#         # Y-channel affine flat from EM (row-basis + translation)
+#         np.save(cdir / "Y_flat_V.npy", Vs_np[k])  # (J,d)
+#         np.save(cdir / "Y_flat_v.npy", vs_np[k])  # (d,)
+
+#         # per-channel means + bases (from per-cluster PCA on TRAIN set)
+#         means_k = means[k].detach().cpu().numpy()        # (3,d)
+#         bases_k = bases[k].detach().cpu().numpy()        # (3,J,d)
+#         np.save(cdir / "means.npy", means_k)
+#         np.save(cdir / "bases.npy", bases_k)
+
+#         # normalized eigenimages for this cluster only (J,3,H,W)
+#         vis_list = []
+#         for j in range(J):
+#             trip = []
+#             for ch in range(3):
+#                 v = bases[k, ch, j].view(H, W).cpu().numpy()
+#                 v01 = (v - mins[ch]) / den[ch]
+#                 v01 = np.clip(v01, 0.0, 1.0)
+#                 trip.append(v01[None, ...])   # (1,H,W)
+#                 Image.fromarray((v01*255.0).astype(np.uint8), mode="L").save(
+#                     cdir / "vis" / f"{j:03d}-ch{ch}.png"
+#                 )
+#             vis_list.append(np.concatenate(trip, axis=0))  # (3,H,W)
+#         arrs_k = np.stack(vis_list, axis=0)  # (J,3,H,W)
+#         np.save(cdir / "arrs.npy", arrs_k)
+
+#         # metadata
+#         idxs_all = np.where(assign == k)[0]
+#         meta = {
+#             "cluster": int(k),
+#             "num_members": int(idxs_all.size),
+#             "num_train": int(train_idxs_per_k[k].size),
+#             "num_test": int(test_idxs_per_k[k].size),
+#             "img_size": [W, H],
+#             "J": int(J),
+#             "d": int(d),
+#             "norm_mins": mins.tolist(),
+#             "norm_maxs": maxs.tolist(),
+#             "files": ["train_indices.npy", "test_indices.npy",
+#                       "Y_flat_V.npy", "Y_flat_v.npy",
+#                       "means.npy", "bases.npy", "arrs.npy"],
+#         }
+#         with open(cdir / "meta.json", "w") as f:
+#             json.dump(meta, f, indent=2)
 
 def save_split_images(img_paths, train_idxs_per_k, test_idxs_per_k, outdir: Path, img_size: tuple[int,int]):
     """
@@ -291,11 +398,15 @@ if __name__ == "__main__":
     Cr_t = torch.as_tensor(Cr, dtype=torch.float32, device=device)
     w_t = torch.ones((N,), dtype=torch.float32, device=device)
     Vs_t, vs_t, _ = EMLikeAlg(Y_t, Cb_t, Cr_t, w_t, j=args.J_dim, k=args.K_clusters, steps=args.steps)
-    assign_t = assign_points(Y_t, Cb_t, Cr_t, w_t, Vs_t, vs_t)
+    assign_t = assign_points(Y_t, Cb_t, Cr_t, Vs_t, vs_t, w=w_t, alphas=(1.0, 1, 1))
     assign = assign_t.detach().cpu().numpy()
     Vs = Vs_t.detach().cpu().numpy()
     vs = vs_t.detach().cpu().numpy()
     sizes = np.bincount(assign, minlength=args.K_clusters)
+    # Helpful top-level artifacts
+    np.save(outdir / "assign.npy", assign)           # per-image cluster label
+    with open(outdir / "em_shapes.json", "w") as f:  # shape audit
+        json.dump({"Vs": list(Vs.shape), "vs": list(vs.shape)}, f, indent=2)
     print(f"done in {time.time()-t0:.2f}s | cluster sizes={sizes.tolist()}")
 
     # == [3/5] Split train/test per cluster ==
