@@ -313,25 +313,183 @@ def computeSuboptimalSubspace(P: torch.Tensor, w: torch.Tensor, J: int):
 
 #     return min_Vs, min_vs, (time.time() - start_time)
 
+# @torch.no_grad()
+# def EMLikeAlg(PY: torch.Tensor, PCB: torch.Tensor, PCR: torch.Tensor,
+#               w: torch.Tensor, j: int, k: int, steps: int,
+#               alphas=(1.0, 0.25, 0.25), verbose=True):
+#     """
+#     Multi-channel EM for (K,J)-projective clustering with shared assignments.
+
+#     Inputs:
+#       PY, PCB, PCR: (N,d) Y/Cb/Cr feature matrices (float)
+#       w: (N,) weights
+#       j: subspace dim per channel
+#       k: number of clusters
+#       steps: EM iterations
+#       alphas: (αY, αCb, αCr) channel weights in the joint cost
+
+#     Returns:
+#       Vs: (K, 3, j, d)  row bases per (cluster, channel)
+#       vs: (K, 3, d)     means per (cluster, channel)
+#       elapsed_sec: float
+#     """
+#     start_time = time.time()
+#     N, d = PY.shape
+#     device, dtype = PY.device, PY.dtype
+#     aY, aCb, aCr = [float(x) for x in alphas]
+
+#     # storage
+#     Vs = torch.empty((k, 3, j, d), device=device, dtype=dtype)
+#     vs = torch.empty((k, 3, d),    device=device, dtype=dtype)
+
+#     best_Vs = None
+#     best_vs = None
+#     best_obj = float('inf')
+
+#     for init_id in range(NUM_INIT_FOR_EM):
+#         # --- initialization: same index chunks across channels ---
+#         idxs = torch.randperm(N, device=device)
+#         chunks = torch.chunk(idxs, k)
+
+#         for c in range(k):
+#             n_c = chunks[c].numel()
+#             J_use = min(j, n_c) if n_c > 0 else 0
+
+#             # Y
+#             if J_use > 0:
+#                 Vi, vi, _ = computeSuboptimalSubspace(PY[chunks[c], :], w[chunks[c]], J_use)
+#                 Vs[c, 0].zero_()
+#                 Vs[c, 0, :J_use, :] = Vi
+#                 vs[c, 0, :] = vi
+#             else:
+#                 Vs[c, 0].zero_(); vs[c, 0].zero_()
+
+#             # Cb
+#             if J_use > 0:
+#                 Vi, vi, _ = computeSuboptimalSubspace(PCB[chunks[c], :], w[chunks[c]], J_use)
+#                 Vs[c, 1].zero_()
+#                 Vs[c, 1, :J_use, :] = Vi
+#                 vs[c, 1, :] = vi
+#             else:
+#                 Vs[c, 1].zero_(); vs[c, 1].zero_()
+
+#             # Cr
+#             if J_use > 0:
+#                 Vi, vi, _ = computeSuboptimalSubspace(PCR[chunks[c], :], w[chunks[c]], J_use)
+#                 Vs[c, 2].zero_()
+#                 Vs[c, 2, :J_use, :] = Vi
+#                 vs[c, 2, :] = vi
+#             else:
+#                 Vs[c, 2].zero_(); vs[c, 2].zero_()
+
+#         prev_assign = None
+
+#         # --- EM iterations ---
+#         for step_id in range(steps):
+#             # distances to each cluster per channel
+#             dY  = torch.empty((N, k), device=device, dtype=dtype)
+#             dCb = torch.empty((N, k), device=device, dtype=dtype)
+#             dCr = torch.empty((N, k), device=device, dtype=dtype)
+
+#             for c in range(k):
+#                 dY[:,  c] = OBJECTIVE_LOSS(computeDistanceToSubspace(PY,  Vs[c, 0], vs[c, 0]))
+#                 dCb[:, c] = OBJECTIVE_LOSS(computeDistanceToSubspace(PCB, Vs[c, 1], vs[c, 1]))
+#                 dCr[:, c] = OBJECTIVE_LOSS(computeDistanceToSubspace(PCR, Vs[c, 2], vs[c, 2]))
+
+#             joint = w.unsqueeze(1) * (aY*dY + aCb*dCb + aCr*dCr)   # (N,k)
+
+#             # E-step: shared assignment
+#             assign = torch.argmin(joint, dim=1)   # (N,)
+
+#             # --- diagnostics / printing ---
+#             if verbose:
+#                 per_point = joint.gather(1, assign.view(-1,1)).squeeze(1)
+#                 total_obj = float(per_point.sum().item())
+#                 sizes = torch.bincount(assign, minlength=k)
+
+#                 sums = torch.zeros(k, device=device, dtype=dtype)
+#                 sums.scatter_add_(0, assign, per_point)
+#                 mean_cost = (sums / sizes.clamp(min=1).to(dtype)).detach().cpu().tolist()
+
+#                 if prev_assign is None:
+#                     changed = 0; moved_in=[0]*k; moved_out=[0]*k
+#                 else:
+#                     changed = int((assign != prev_assign).sum().item())
+#                     moved_in, moved_out = [], []
+#                     for c in range(k):
+#                         in_c  = int(((assign == c) & (prev_assign != c)).sum().item())
+#                         out_c = int(((prev_assign == c) & (assign != c)).sum().item())
+#                         moved_in.append(in_c); moved_out.append(out_c)
+
+#                 print(f"[init {init_id+1}/{NUM_INIT_FOR_EM}] step {step_id+1}/{steps} | "
+#                       f"obj={total_obj:.4f} | sizes={sizes.tolist()} | "
+#                       f"mean_joint={[round(x,4) for x in mean_cost]} | "
+#                       f"changed={changed} | in={moved_in} | out={moved_out}")
+
+#             prev_assign = assign.clone()
+
+#             # M-step: refit per-channel flats for each cluster
+#             for c in range(k):
+#                 mask = (assign == c)
+#                 n_c = int(mask.sum().item())
+#                 if n_c == 0:
+#                     continue
+#                 J_use = min(j, n_c)
+#                 idx = torch.nonzero(mask, as_tuple=False).view(-1)
+
+#                 # Y
+#                 Vi, vi, _ = computeSuboptimalSubspace(PY.index_select(0, idx),
+#                                                       w.index_select(0, idx), J_use)
+#                 Vs[c, 0].zero_(); Vs[c, 0, :J_use, :] = Vi
+#                 vs[c, 0, :] = vi
+
+#                 # Cb
+#                 Vi, vi, _ = computeSuboptimalSubspace(PCB.index_select(0, idx),
+#                                                       w.index_select(0, idx), J_use)
+#                 Vs[c, 1].zero_(); Vs[c, 1, :J_use, :] = Vi
+#                 vs[c, 1, :] = vi
+
+#                 # Cr
+#                 Vi, vi, _ = computeSuboptimalSubspace(PCR.index_select(0, idx),
+#                                                       w.index_select(0, idx), J_use)
+#                 Vs[c, 2].zero_(); Vs[c, 2, :J_use, :] = Vi
+#                 vs[c, 2, :] = vi
+
+#         # ---- end init: evaluate final joint objective (FIX: per-cluster mask; no Vs[assign,...]) ----
+#         final_joint = torch.zeros(N, device=device, dtype=dtype)
+#         unique = torch.unique(assign)
+#         for c in unique.tolist():
+#             m = (assign == c)
+#             if not m.any():
+#                 continue
+#             dYc  = OBJECTIVE_LOSS(computeDistanceToSubspace(PY[m],  Vs[c, 0], vs[c, 0]))
+#             dCbc = OBJECTIVE_LOSS(computeDistanceToSubspace(PCB[m], Vs[c, 1], vs[c, 1]))
+#             dCrc = OBJECTIVE_LOSS(computeDistanceToSubspace(PCR[m], Vs[c, 2], vs[c, 2]))
+#             final_joint[m] = w[m] * (aY*dYc + aCb*dCbc + aCr*dCrc)
+
+#         curr_obj = float(final_joint.sum().item())
+#         if curr_obj < best_obj:
+#             best_obj = curr_obj
+#             best_Vs  = copy.deepcopy(Vs)
+#             best_vs  = copy.deepcopy(vs)
+
+#         if verbose:
+#             print(f"[init {init_id+1}] final joint obj = {curr_obj:.6f}")
+
+#     return best_Vs, best_vs, (time.time() - start_time)
+
+
+
 @torch.no_grad()
 def EMLikeAlg(PY: torch.Tensor, PCB: torch.Tensor, PCR: torch.Tensor,
               w: torch.Tensor, j: int, k: int, steps: int,
-              alphas=(1.0, 0.25, 0.25), verbose=True):
+              alphas=(1.0, 0.25, 0.25), verbose=True,
+              patience: int = 1, tol_abs: float = 1e-6, tol_rel: float = 1e-8):
     """
     Multi-channel EM for (K,J)-projective clustering with shared assignments.
 
-    Inputs:
-      PY, PCB, PCR: (N,d) Y/Cb/Cr feature matrices (float)
-      w: (N,) weights
-      j: subspace dim per channel
-      k: number of clusters
-      steps: EM iterations
-      alphas: (αY, αCb, αCr) channel weights in the joint cost
-
-    Returns:
-      Vs: (K, 3, j, d)  row bases per (cluster, channel)
-      vs: (K, 3, d)     means per (cluster, channel)
-      elapsed_sec: float
+    Early stop: if the total joint objective doesn't change (|Δ| <= max(tol_abs, tol_rel*prev))
+    for `patience` consecutive steps, stop this init and proceed to the next.
     """
     start_time = time.time()
     N, d = PY.shape
@@ -358,8 +516,7 @@ def EMLikeAlg(PY: torch.Tensor, PCB: torch.Tensor, PCR: torch.Tensor,
             # Y
             if J_use > 0:
                 Vi, vi, _ = computeSuboptimalSubspace(PY[chunks[c], :], w[chunks[c]], J_use)
-                Vs[c, 0].zero_()
-                Vs[c, 0, :J_use, :] = Vi
+                Vs[c, 0].zero_(); Vs[c, 0, :J_use, :] = Vi
                 vs[c, 0, :] = vi
             else:
                 Vs[c, 0].zero_(); vs[c, 0].zero_()
@@ -367,8 +524,7 @@ def EMLikeAlg(PY: torch.Tensor, PCB: torch.Tensor, PCR: torch.Tensor,
             # Cb
             if J_use > 0:
                 Vi, vi, _ = computeSuboptimalSubspace(PCB[chunks[c], :], w[chunks[c]], J_use)
-                Vs[c, 1].zero_()
-                Vs[c, 1, :J_use, :] = Vi
+                Vs[c, 1].zero_(); Vs[c, 1, :J_use, :] = Vi
                 vs[c, 1, :] = vi
             else:
                 Vs[c, 1].zero_(); vs[c, 1].zero_()
@@ -376,13 +532,15 @@ def EMLikeAlg(PY: torch.Tensor, PCB: torch.Tensor, PCR: torch.Tensor,
             # Cr
             if J_use > 0:
                 Vi, vi, _ = computeSuboptimalSubspace(PCR[chunks[c], :], w[chunks[c]], J_use)
-                Vs[c, 2].zero_()
-                Vs[c, 2, :J_use, :] = Vi
+                Vs[c, 2].zero_(); Vs[c, 2, :J_use, :] = Vi
                 vs[c, 2, :] = vi
             else:
                 Vs[c, 2].zero_(); vs[c, 2].zero_()
 
         prev_assign = None
+        assign = None  # will hold last assignments
+        prev_obj = None
+        stall_count = 0
 
         # --- EM iterations ---
         for step_id in range(steps):
@@ -401,12 +559,13 @@ def EMLikeAlg(PY: torch.Tensor, PCB: torch.Tensor, PCR: torch.Tensor,
             # E-step: shared assignment
             assign = torch.argmin(joint, dim=1)   # (N,)
 
+            # compute objective of current step (sum of chosen joint costs)
+            per_point = joint.gather(1, assign.view(-1,1)).squeeze(1)
+            total_obj = float(per_point.sum().item())
+
             # --- diagnostics / printing ---
             if verbose:
-                per_point = joint.gather(1, assign.view(-1,1)).squeeze(1)
-                total_obj = float(per_point.sum().item())
                 sizes = torch.bincount(assign, minlength=k)
-
                 sums = torch.zeros(k, device=device, dtype=dtype)
                 sums.scatter_add_(0, assign, per_point)
                 mean_cost = (sums / sizes.clamp(min=1).to(dtype)).detach().cpu().tolist()
@@ -426,6 +585,21 @@ def EMLikeAlg(PY: torch.Tensor, PCB: torch.Tensor, PCR: torch.Tensor,
                       f"mean_joint={[round(x,4) for x in mean_cost]} | "
                       f"changed={changed} | in={moved_in} | out={moved_out}")
 
+            # --- early stopping check ---
+            if prev_obj is not None:
+                tol = max(tol_abs, tol_rel * abs(prev_obj))
+                if abs(total_obj - prev_obj) <= tol:
+                    stall_count += 1
+                else:
+                    stall_count = 0
+            prev_obj = total_obj
+
+            if stall_count >= patience:
+                if verbose:
+                    print(f"[init {init_id+1}] early stop at step {step_id+1} "
+                          f"(no improvement for {patience} consecutive steps).")
+                break
+
             prev_assign = assign.clone()
 
             # M-step: refit per-channel flats for each cluster
@@ -442,20 +616,26 @@ def EMLikeAlg(PY: torch.Tensor, PCB: torch.Tensor, PCR: torch.Tensor,
                                                       w.index_select(0, idx), J_use)
                 Vs[c, 0].zero_(); Vs[c, 0, :J_use, :] = Vi
                 vs[c, 0, :] = vi
-
                 # Cb
                 Vi, vi, _ = computeSuboptimalSubspace(PCB.index_select(0, idx),
                                                       w.index_select(0, idx), J_use)
                 Vs[c, 1].zero_(); Vs[c, 1, :J_use, :] = Vi
                 vs[c, 1, :] = vi
-
                 # Cr
                 Vi, vi, _ = computeSuboptimalSubspace(PCR.index_select(0, idx),
                                                       w.index_select(0, idx), J_use)
                 Vs[c, 2].zero_(); Vs[c, 2, :J_use, :] = Vi
                 vs[c, 2, :] = vi
 
-        # ---- end init: evaluate final joint objective (FIX: per-cluster mask; no Vs[assign,...]) ----
+        # If steps==0 (or any edge) ensure we have an assignment
+        if assign is None:
+            dY  = torch.stack([OBJECTIVE_LOSS(computeDistanceToSubspace(PY,  Vs[c,0], vs[c,0])) for c in range(k)], dim=1)
+            dCb = torch.stack([OBJECTIVE_LOSS(computeDistanceToSubspace(PCB, Vs[c,1], vs[c,1])) for c in range(k)], dim=1)
+            dCr = torch.stack([OBJECTIVE_LOSS(computeDistanceToSubspace(PCR, Vs[c,2], vs[c,2])) for c in range(k)], dim=1)
+            joint = w.unsqueeze(1) * (aY*dY + aCb*dCb + aCr*dCr)
+            assign = torch.argmin(joint, dim=1)
+
+        # ---- end init: evaluate final joint objective (per-cluster mask; no Vs[assign,...]) ----
         final_joint = torch.zeros(N, device=device, dtype=dtype)
         unique = torch.unique(assign)
         for c in unique.tolist():
@@ -476,7 +656,8 @@ def EMLikeAlg(PY: torch.Tensor, PCB: torch.Tensor, PCR: torch.Tensor,
         if verbose:
             print(f"[init {init_id+1}] final joint obj = {curr_obj:.6f}")
 
-    return best_Vs, best_vs, (time.time() - start_time)# @torch.no_grad()
+    return best_Vs, best_vs, (time.time() - start_time)
+    # @torch.no_grad()
 # def assign_points(P: torch.Tensor, w: torch.Tensor, Vs: torch.Tensor, vs: torch.Tensor) -> torch.Tensor:
 #     K = Vs.shape[0]
 #     N = P.shape[0]
