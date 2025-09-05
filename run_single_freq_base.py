@@ -80,7 +80,7 @@ class GaussianTrainer:
         if model_path is not None:
             self.model_path = Path(model_path)
             self.logwriter.write(f"Model loaded from: {model_path}")
-            checkpoint = torch.load(model_path, map_location=self.device)
+            checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
             self.gaussian_model.load_state_dict(checkpoint['model_state_dict'])
 
         # === NEW === W&B init
@@ -369,7 +369,6 @@ class GaussianTrainer:
             norm_infos = pickle.load(FIN)
 
         # load image
-        print(img_path)
         gt_img = self._load_ycbcr_tensor(img_path)  # (3,H,W)
         img_arr = gt_img.detach().cpu().numpy().reshape(3, -1)
 
@@ -523,7 +522,7 @@ def parse_args(argv):
     parser.add_argument("--wandb_entity", type=str, default=None, help="W&B entity (optional)")
     parser.add_argument("--run_name", type=str, default=None, help="W&B run name (optional)")
     parser.add_argument("--eval_every", type=int, default=1000, help="Eval cadence in iters during phase-A")
-    parser.add_argument("--eval_images", type=int, default=10, help="How many test images to evaluate")
+    parser.add_argument("--eval_images", type=int, default=100000, help="How many test images to evaluate")
     parser.add_argument("--eval_opt_iters", type=int, default=200, help="Short phase-B iters per eval image")
     parser.add_argument("--test_glob", type=str, default=None, help="Optional glob for test images, e.g. './datasets/kodak/test/*.png'")
         # after existing eval controls

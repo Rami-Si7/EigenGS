@@ -43,6 +43,7 @@ def load_cluster_arrs(projective_dir: Path, cluster_ids: List[int]) -> torch.Ten
     shape = None
     for k in cluster_ids:
         cdir = projective_dir / "clusters" / f"cluster_{k:02d}"
+        print(cdir)
         A = np.load(cdir / "arrs.npy")  # (J,3,H,W)
         if shape is None:
             shape = A.shape

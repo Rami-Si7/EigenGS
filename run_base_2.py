@@ -81,7 +81,7 @@ class GaussianTrainer:
         if model_path is not None:
             self.model_path = Path(model_path)
             self.logwriter.write(f"Model loaded from: {model_path}")
-            checkpoint = torch.load(model_path, map_location=self.device)
+            checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
             self.gaussian_model.load_state_dict(checkpoint['model_state_dict'])
 
         # === NEW === W&B init
@@ -508,7 +508,7 @@ class GaussianTrainer:
 
         rows = []
         wandb_rows = []  # for Image table (GT/INIT/FINAL)
-        for p in tqdm(eval_list, desc=f"Eval@{global_iter}"):
+        for p in tqdm(eval_list , disable=True):
             res = self._phaseB_eval_single(
                 base_state_dict=base_state,
                 img_path=p,
@@ -565,12 +565,13 @@ class GaussianTrainer:
             wandb.log({
                 "iter": global_iter,
                 "eval/num_images": int(len(rows)),
-                "eval/psnr_init_mean": float(psnrI.mean()),
-                "eval/psnr_final_mean": float(psnrF.mean()),
-                "eval/ssim_init_mean": float(ssimI.mean()),
-                "eval/ssim_final_mean": float(ssimF.mean()),
+                "eval/mean_psnr_init": float(psnrI.mean()),
+                "eval/mean_psnr_final": float(psnrF.mean()),
+                "eval/mean_ssim_init": float(ssimI.mean()),
+                "eval/mean_ssim_final": float(ssimF.mean()),
                 "eval/table_images": table,
             }, step=global_iter)
+
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description="Example training script.")
@@ -636,6 +637,8 @@ def main(argv):
 
     if not args.skip_train:
         trainer.train()
+    if args.test_dir:
+        trainer.eval_phaseB_on_test_set(global_iter=args.eval_opt_iters)
     else:
         trainer.optimize()
  
