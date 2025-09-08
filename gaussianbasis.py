@@ -7,8 +7,6 @@ import numpy as np
 import math
 from optimizer import Adan
 from pytorch_msssim import ms_ssim
-import torch.nn.functional as F  # <-- add; train_iter already uses F
-
 
 class GaussianBasis(nn.Module):
     def __init__(self, loss_type="L2", **kwargs):
@@ -47,26 +45,6 @@ class GaussianBasis(nn.Module):
 
         self.opt_type = kwargs["opt_type"]
         self.lr = kwargs["lr"]
-
-
-                # --- k-PCA extension (non-breaking) ---
-        self.use_kpca = kwargs.get("use_kpca", False)           # enable multi-subspace mapping
-        self.num_clusters = int(kwargs.get("num_clusters", 1))   # k from your parser
-
-        # will be set per-image by trainer/dataset
-        self.current_cluster_id = None
-        self.current_w = None   # torch.tensor of shape (3, num_comps), per-image PCA coeffs
-
-        # Create per-cluster per-component weights (ψ′) only if enabled
-        if self.use_kpca and self.num_clusters > 1:
-            for freq in (["low", "high", "all"]):
-                start_f, end_f, num_pts = self.config[freq]  # (feature_start, feature_end, num_points_in_group)
-                num_feats = end_f - start_f                  # number of PCA components in this freq block
-                # shape: (num_feats, num_pts, 3, num_clusters)
-                self.params[f"{freq}_psi_kpca"] = nn.Parameter(
-                    0.01 * torch.randn(num_feats, num_pts, 3, self.num_clusters)
-                )
-
     
     @property
     def get_colors(self):
@@ -76,27 +54,10 @@ class GaussianBasis(nn.Module):
     def get_xyz(self):
         return self.params[f"{self.cur_freq}_xyz"]
 
-    # @property
-    # def get_features(self):
-    #     return self.params[f"{self.cur_freq}_features_dc"]
     @property
     def get_features(self):
-        """
-        Returns per-component per-Gaussian RGB weights for the *current freq block*.
-        - Default: use your original learnable features (backwards compatible).
-        - If k-PCA is enabled and cluster_id is set: slice ψ′ for that cluster.
-        """
-        if (
-            self.use_kpca and
-            self.num_clusters > 1 and
-            self.current_cluster_id is not None and
-            f"{self.cur_freq}_psi_kpca" in self.params
-        ):
-            # (num_feats, num_pts, 3, C) --> cluster slice --> (num_feats, num_pts, 3)
-            return self.params[f"{self.cur_freq}_psi_kpca"][..., self.current_cluster_id]
-        # fallback: original single-subspace features
         return self.params[f"{self.cur_freq}_features_dc"]
-
+    
     @property
     def get_cholesky_elements(self):
         return self.params[f"{self.cur_freq}_cholesky"]+self.cholesky_bound
@@ -111,15 +72,6 @@ class GaussianBasis(nn.Module):
         # return self._opacity[config[0]:config[1], :]
         return self._opacity[:config[2], :]
 
-    def set_cluster_and_proj(self, cluster_id: int, w):
-        """
-        Set hard cluster assignment for the current image and its PCA coefficients.
-        w: (3, num_comps) tensor or numpy (Y, Cb, Cr per-component weights).
-        """
-        self.current_cluster_id = int(cluster_id)
-        if not torch.is_tensor(w):
-            w = torch.from_numpy(w)
-        self.current_w = w.to(self.device).float()  # (3, num_comps)
 
     def _forward_colors(self):
         self.xys, depths, self.radii, conics, num_tiles_hit = project_gaussians_2d(
@@ -209,44 +161,6 @@ class GaussianBasis(nn.Module):
         self.optimizer.zero_grad(set_to_none=True)
         self.scheduler.step()
         return loss, psnr
-        
-    @torch.no_grad()
-    def forward_kpca_init(self):
-        """
-        Render an initial reconstruction Ĩ using the current freq block, the current cluster,
-        and the provided PCA coefficients self.current_w.
-
-        Requires:
-          - self.use_kpca == True and self.num_clusters > 1
-          - self.current_cluster_id is not None
-          - self.current_w is set with shape (3, num_comps)
-        """
-        assert self.use_kpca and self.num_clusters > 1, "Enable use_kpca and set num_clusters>1"
-        assert self.current_cluster_id is not None, "Call set_cluster_and_proj(...) first"
-        assert self.cur_freq is not None, "Set self.cur_freq to one of {'low','high','all'}"
-
-        # Geometry & opacity for current freq block
-        self.xys, depths, self.radii, conics, num_tiles_hit = project_gaussians_2d(
-            self.get_xyz, self.get_cholesky_elements, self.H, self.W, self.tile_bounds
-        )
-
-        # Select ψ′ and the matching slice of coefficients for this freq block
-        start_f, end_f, _ = self.config[self.cur_freq]
-        w_group = self.current_w[:, start_f:end_f]          # (3, Kf)
-        psi = self.params[f"{self.cur_freq}_psi_kpca"][..., self.current_cluster_id]  # (Kf, N, 3)
-
-        # Per-Gaussian RGB:  features[n, ch] = sum_j psi[j, n, ch] * w[ch, j]
-        # psi: (Kf, N, 3), w_group: (3, Kf)  ->  (N, 3)
-        features = torch.einsum('knc,ck->nc', psi, w_group)  # (N, 3)
-
-        out_img = rasterize_gaussians_sum(
-            self.xys, depths, self.radii, conics, num_tiles_hit,
-            features, self.get_opacity, self.H, self.W, self.BLOCK_H, self.BLOCK_W,
-            background=self.background, return_alpha=False
-        )
-        out_img *= self.scale_factor
-        out_img += self.shift_factor
-        return out_img.permute(2, 0, 1).contiguous()  # (3, H, W)
 
 
     def scheduler_init(self, optimize_phase=False):

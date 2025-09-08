@@ -1,579 +1,741 @@
-# run_projective.py
-"""
-Projective-clustering variant of the EigenGS trainer (per-channel parse, EM-based eval init).
+# train_eigens_clustered.py
+# Clustered EigenGS training & evaluation (YCbCr per-channel projective clustering only).
+#
+# Usage (clustered; auto-detected by parse_emlike.py layout):
+#   python train_eigens_clustered.py -d ./out/<UUID>-K6-J50/ --iterations 50000 --num_points 50000
+# Optional:
+#   --test_dir ./some_images/ --eval_every 2000 --eval_opt_iters 200 --psnr_threshold 35
 
-What this version does:
-- Loads components from projective_dir/{Y,Cb,Cr}/arrs.npy and meta.json for training.
-- Also loads per-channel EM flats: em_Vs.npy (K,J,d), em_vs.npy (K,d).
-- Builds a single training target tensor (3*K*J, 3, H, W) whose entries are single-channel.
-- During evaluation (every --eval_every) and in optimize_single:
-    For each image:
-      1) For each channel (Y, Cb, Cr), choose the closest cluster by EM residual.
-      2) Project onto that channel's affine EM flat to get a per-channel reconstruction.
-      3) Stack the three channel reconstructions to a full YCbCr image.
-      4) Set model.image_mean = this reconstruction (so init equals the EM recon).
-      5) Run a short Phase-B refinement and report PSNR/SSIM.
-
-Test set:
-- Uses projective_dir/all_test/ (global, identical across channels).
-  Can be overridden with --test_dir / --test_glob.
-"""
-
-import os
 import math
-import json
-import random
-import argparse
-import sys
+import time
 from pathlib import Path
-from typing import List, Tuple, Dict, Optional
-
+import argparse
 import numpy as np
 import torch
-import torch.nn.functional as F
-from skimage import color
+import sys
 from PIL import Image
-from tqdm import tqdm
+import torch.nn.functional as F
 from pytorch_msssim import ms_ssim
+from utils import *  # assumes loss_fn, etc.
+from tracker import LogWriter, PSNRTracker
+from tqdm import tqdm
+import random
+import torchvision.transforms as transforms
+from skimage import color
+import uuid
+import copy
+import json
+import os
+from typing import List, Dict, Any
 
-# ----- model -----
-from gaussianbasis_single_freq_base import GaussianBasis
+# ====== OPTIONAL W&B ======
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except Exception:
+    WANDB_AVAILABLE = False
+
+# ====== MODEL IMPORT ======
+# If your class is in a different file, update this import.
+from gaussianbasis_projective import GaussianBasis
 
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 
-# ----------------------------- Argparse -----------------------------
 
-def parse_args(argv):
-    p = argparse.ArgumentParser("Projective-clustering EigenGS trainer (per-channel)")
-
-    # projective dataset root (output dir of the per-channel parse script)
-    p.add_argument("--projective_dir", type=str, required=True,
-                   help="Directory produced by the per-channel parse (contains Y/, Cb/, Cr/, all_test/)")
-    p.add_argument("--iterations", type=int, default=50000)
-    p.add_argument("--num_points", type=int, default=50000)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--seed", type=int, default=1)
-    p.add_argument("--loss", type=str, default="L2")
-
-    # Phase-B optimize a single image (optional)
-    p.add_argument("--image_path", type=str, default=None)
-    p.add_argument("--skip_train", action="store_true")
-
-    p.add_argument("--model_path", type=str, default=None,
-                   help="Path to a Phase-A checkpoint (.pth.tar) to load before Phase-B/eval")
-    p.add_argument("--eval_only", action="store_true",
-                   help="Skip training and run a single full Phase-B eval on the test set")
-
-    # evaluation controls
-    p.add_argument("--eval_every", type=int, default=1000)
-    p.add_argument("--eval_opt_iters", type=int, default=200)
-    p.add_argument("--test_dir", type=str, default=None,
-                   help="Optional external folder of test images; if omitted, uses projective_dir/all_test")
-    p.add_argument("--test_recursive", action="store_true")
-    p.add_argument("--test_glob", type=str, default=None)
-
-    # logging
-    p.add_argument("--out_dir", type=str, default="./models_projective")
-
-    # Weights & Biases
-    p.add_argument("--wandb", action="store_true")
-    p.add_argument("--wandb_project", type=str, default=os.getenv("WANDB_PROJECT", "eigens"))
-    p.add_argument("--wandb_entity", type=str, default=None)
-    p.add_argument("--run_name", type=str, default=None)
-
-    return p.parse_args(argv)
-
-# ----------------------------- Per-channel loaders & helpers -----------------------------
-
-def _load_root_meta(root: Path) -> Tuple[int, int, int, int]:
-    """Returns (W, H, K, J) from top-level meta.json (written by the new parser)."""
-    meta = json.loads((root / "meta.json").read_text())
-    W, H = meta["img_size"]
-    K = int(meta["K"])
-    J = int(meta["J"])
-    return W, H, K, J
-
-def _load_channel_pca(root: Path, name: str):
-    """
-    Load one channel folder (Y or Cb or Cr) PCA artifacts used for Phase-A training visuals:
-      - pca_means.npy: (K, d)
-      - pca_bases.npy: (K, J, d)
-      - arrs.npy: (K*J, H, W)   [normalized 0..1 eigenimages]
-    """
-    ch_dir = root / name
-    means = np.load(ch_dir / "pca_means.npy")   # (K, d)
-    bases = np.load(ch_dir / "pca_bases.npy")   # (K, J, d)
-    arrs  = np.load(ch_dir / "arrs.npy")        # (K*J, H, W)
-    return means, bases, arrs
-
-def _load_channel_em(root: Path, name: str):
-    """
-    Load one channel EM flats used for eval cluster selection + init recon:
-      - em_Vs.npy: (K, J, d)  (row-orthonormal basis per cluster)
-      - em_vs.npy: (K, d)     (affine offset per cluster)
-    """
-    ch_dir = root / name
-    Vs = np.load(ch_dir / "em_Vs.npy").astype(np.float32)  # (K,J,d)
-    vs = np.load(ch_dir / "em_vs.npy").astype(np.float32)  # (K,d)
-    return Vs, vs
-
-def _build_training_targets(Y_arrs, Cb_arrs, Cr_arrs, H: int, W: int) -> torch.Tensor:
-    """
-    Given per-channel arrs (each (K*J, H, W) in [0,1]), build a single tensor:
-        gt_arrs: (3*K*J, 3, H, W)
-    Component i is single-channel (only one of Y/Cb/Cr is non-zero).
-    """
-    KJ = Y_arrs.shape[0]
-    out = np.zeros((3*KJ, 3, H, W), dtype=np.float32)
-    out[0:KJ, 0, :, :] = Y_arrs
-    out[KJ:2*KJ, 1, :, :] = Cb_arrs
-    out[2*KJ:3*KJ, 2, :, :] = Cr_arrs
-    return torch.from_numpy(out)  # (3*KJ,3,H,W)
-
-def _rgb_path_to_ycbcr(path: Path, size_hw: Tuple[int,int]) -> torch.Tensor:
-    W, H = size_hw
-    img = Image.open(path).convert("RGB").resize((W, H), Image.Resampling.LANCZOS)
-    arr = np.asarray(img, dtype=np.uint8)
-    ycbcr = color.rgb2ycbcr(arr).astype(np.float32) / 255.0  # [0,1], (H,W,3)
-    t = torch.from_numpy(ycbcr.transpose(2,0,1))             # (3,H,W)
-    return t
-
-# ---------- EM projection helpers ----------
-def _project_em_affine(x_d: np.ndarray, V_Jd: np.ndarray, v_d: np.ndarray, T: Optional[int]) -> Tuple[np.ndarray, float]:
-    """
-    Orthogonal projection onto affine EM flat: rec = v + ((x-v) @ V^T) @ V
-    Returns (reconstructed_d, squared_residual).
-    Assumes rows of V are orthonormal (as fit by the EM step via SVD).
-    """
-    if T is not None:
-        Juse = int(min(T, V_Jd.shape[0]))
-        V = V_Jd[:Juse, :]
-    else:
-        V = V_Jd
-    r = x_d - v_d
-    r_par = (r @ V.T) @ V
-    rec = v_d + r_par
-    err2 = float(np.sum((r - r_par) ** 2, dtype=np.float64))
-    return rec, err2
-
-def _choose_cluster_em_and_reconstruct(x_ch: torch.Tensor, Vs_KJd: np.ndarray, vs_Kd: np.ndarray,
-                                       T: Optional[int]) -> Tuple[int, np.ndarray]:
-    """
-    For a single channel image x_ch (H,W):
-      - Evaluate residual vs every cluster's EM flat
-      - Return (best_k, reconstruction_d) where reconstruction is v_k + proj onto span(V_k)
-    """
-    x = x_ch.reshape(-1).detach().cpu().numpy()  # (d,)
-    K = Vs_KJd.shape[0]
-    best_k, best_err, best_rec = 0, float("inf"), None
-    for k in range(K):
-        rec, e2 = _project_em_affine(x, Vs_KJd[k], vs_Kd[k], T)
-        if e2 < best_err:
-            best_err, best_k, best_rec = e2, k, rec
-    return best_k, best_rec  # best_rec is (d,)
-
-def _stack_recons(recY_d: np.ndarray, recCb_d: np.ndarray, recCr_d: np.ndarray, H: int, W: int) -> torch.Tensor:
-    rec = np.stack([
-        np.clip(recY_d,  0.0, 1.0),
-        np.clip(recCb_d, 0.0, 1.0),
-        np.clip(recCr_d, 0.0, 1.0),
-    ], axis=0).reshape(3, H, W)
-    return torch.from_numpy(rec).float()
-
-# ----------------------------- Trainer -----------------------------
-
-class ProjectiveTrainer:
-    def __init__(self, args):
+class GaussianTrainer:
+    def __init__(
+        self, args,
+        image_path: str | None = None,
+        num_points: int = 2000,
+        iterations: int = 30000,
+        model_path: str | None = None,
+    ):
         self.args = args
+        self.dataset_path = Path(args.dataset)
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        torch.manual_seed(args.seed); np.random.seed(args.seed); random.seed(args.seed)
 
-        self.projective_dir = Path(args.projective_dir)
-        # top-level sizes
-        W, H, K, J = _load_root_meta(self.projective_dir)
-        self.W, self.H, self.K, self.J = W, H, K, J
-        self.d = W * H
+        # ---- Enforce clustered dataset (layout from parse_emlike.py) ----
+        must_exist = [
+            self.dataset_path / "meta.json",
+            self.dataset_path / "Y",
+            self.dataset_path / "Cb",
+            self.dataset_path / "Cr",
+        ]
+        if not all(p.exists() for p in must_exist):
+            raise FileNotFoundError(
+                "Clustered dataset expected. Make sure the directory contains "
+                "meta.json and subfolders 'Y', 'Cb', 'Cr' produced by parse_emlike.py."
+            )
 
-        # ----- load per-channel PCA artifacts (for Phase-A training targets) -----
-        Y_means_np,  Y_bases_np,  Y_arrs_np  = _load_channel_pca(self.projective_dir, "Y")
-        Cb_means_np, Cb_bases_np, Cb_arrs_np = _load_channel_pca(self.projective_dir, "Cb")
-        Cr_means_np, Cr_bases_np, Cr_arrs_np = _load_channel_pca(self.projective_dir, "Cr")
+        # === CLUSTERED PATH ===
+        # Top-level meta has K and J (per-channel)
+        with open(self.dataset_path / "meta.json", "r") as f:
+            top_meta = json.load(f)
+        self.K = int(top_meta["K"])
+        self.J = int(top_meta["J"])
 
-        # to torch (on device) for PCA (not strictly needed in eval now, but keep for completeness)
-        self.Y_means_pca  = torch.from_numpy(Y_means_np ).float().to(self.device)  # (K,d)
-        self.Cb_means_pca = torch.from_numpy(Cb_means_np).float().to(self.device)
-        self.Cr_means_pca = torch.from_numpy(Cr_means_np).float().to(self.device)
+        def _load_cluster_channel(ch_name: str) -> List[np.ndarray]:
+            clusters_dir = self.dataset_path / ch_name / "clusters"
+            if not clusters_dir.exists():
+                raise FileNotFoundError(f"Expected {clusters_dir} for clustered dataset.")
+            clusters = sorted(clusters_dir.glob("cluster_*"))
+            arr_list = []
+            for cdir in clusters:
+                A = np.load(cdir / "arrs.npy")  # (J,H,W), normalized [0,1] for visualization
+                arr_list.append(A)
+            return arr_list  # K entries
 
-        self.Y_bases_pca  = torch.from_numpy(Y_bases_np ).float().to(self.device)  # (K,J,d)
-        self.Cb_bases_pca = torch.from_numpy(Cb_bases_np).float().to(self.device)
-        self.Cr_bases_pca = torch.from_numpy(Cr_bases_np).float().to(self.device)
+        Ys  = _load_cluster_channel("Y")
+        Cbs = _load_cluster_channel("Cb")
+        Crs = _load_cluster_channel("Cr")
+        assert len(Ys) == len(Cbs) == len(Crs) == self.K
 
-        # Build Phase-A training targets (3*K*J,3,H,W)
-        self.gt_arrs = _build_training_targets(Y_arrs_np, Cb_arrs_np, Cr_arrs_np, H, W).to(self.device)
+        H, W = Ys[0].shape[1], Ys[0].shape[2]
+        planes = []
+        # Build training stack: (3*K*J, 3, H, W), only one active channel per plane
+        for c_idx, pack in enumerate([Ys, Cbs, Crs]):
+            for k in range(self.K):
+                for j in range(self.J):
+                    img3 = np.zeros((3, H, W), dtype=np.float32)
+                    img3[c_idx] = pack[k][j]  # put normalized eigenimage in its own channel
+                    planes.append(img3)
+        self.gt_arrs = torch.from_numpy(np.stack(planes, axis=0)).to(self.device)
 
-        # ----- load per-channel EM flats (for eval/init) -----
-        self.VsY_em,  self.vY_em  = _load_channel_em(self.projective_dir, "Y")   # (K,J,d), (K,d)
-        self.VsCb_em, self.vCb_em = _load_channel_em(self.projective_dir, "Cb")
-        self.VsCr_em, self.vCr_em = _load_channel_em(self.projective_dir, "Cr")
+        # cache per-channel min/max over raw PCA bases (not normalized arrs)
+        self._vmin = np.zeros(3, dtype=np.float32)
+        self._vmax = np.zeros(3, dtype=np.float32)
+        for c_idx, ch_name in enumerate(["Y", "Cb", "Cr"]):
+            mins, maxs = [], []
+            for cdir in sorted((self.dataset_path / ch_name / "clusters").glob("cluster_*")):
+                bases = np.load(cdir / "pca_bases.npy")  # (J,d)
+                mins.append(bases.min())
+                maxs.append(bases.max())
+            self._vmin[c_idx] = float(np.min(mins))
+            self._vmax[c_idx] = float(np.max(maxs))
 
-        # ----- out dir -----
-        mode_tag = "all_channels"
-        self.out_dir = Path(args.out_dir) / f"proj_{self.projective_dir.name}_{mode_tag}_P{args.num_points}_I{args.iterations}_seed{args.seed}"
-        self.out_dir.mkdir(parents=True, exist_ok=True)
+        random_string = str(uuid.uuid4())[:6]
 
-        # ----- model -----
-        self.num_comps = self.gt_arrs.shape[0]  # 3*K*J
-        self.model = GaussianBasis(
-            loss_type=args.loss, opt_type="adan",
-            num_points=args.num_points, num_comps=self.num_comps,
-            H=self.H, W=self.W, BLOCK_H=16, BLOCK_W=16,
-            device=self.device, lr=args.lr
+        if image_path is not None:
+            self.image_path = Path(image_path)
+            self.image_name = self.image_path.stem
+            img = Image.open(self.image_path).convert("RGB").resize((W, H), Image.Resampling.LANCZOS)
+            img_arr = (color.rgb2ycbcr(np.array(img)) / 255.0).transpose(2, 0, 1)
+            self.gt_image = torch.tensor(img_arr, dtype=torch.float32, device=self.device)
+            model_dir = Path(f"./models/recons/{self.image_name}-{self.dataset_path.name}-{num_points}-{args.iterations}-{random_string}")
+        else:
+            self.image_path = None
+            self.image_name = None
+            self.gt_image = None
+            model_dir = Path(f"./models/clustered/{self.dataset_path.name}-{num_points}-{args.iterations}-{random_string}")
+
+        self.num_points = num_points
+        self.num_comps = 3 * self.K * self.J  # number of planes in phase-A target
+        self.H, self.W = int(H), int(W)
+        BLOCK_H, BLOCK_W = 16, 16
+        self.iterations = iterations
+
+        self.model_dir = model_dir
+        self.model_dir.mkdir(parents=True, exist_ok=True)
+
+        # ---- Model ----
+        self.gaussian_model = GaussianBasis(
+            loss_type="L2", opt_type="adan", num_points=self.num_points,
+            H=self.H, W=self.W, BLOCK_H=BLOCK_H, BLOCK_W=BLOCK_W,
+            device=self.device, lr=args.lr,
+            num_comps=self.num_comps,
+            clustered=True, K_clusters=self.K, J_dim=self.J
         ).to(self.device)
-        self.model.scheduler_init()
+        self.gaussian_model.scheduler_init()
+        self.logwriter = LogWriter(self.model_dir)
+        self.psnr_tracker = PSNRTracker(self.logwriter)
+        self.logwriter.write(f"Model Dir ID: {random_string}")
 
-        # ----- wandb -----
+        if model_path is not None:
+            self.model_path = Path(model_path)
+            self.logwriter.write(f"Model loaded from: {model_path}")
+            checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
+            self.gaussian_model.load_state_dict(checkpoint['model_state_dict'])
+
+        # ---- W&B ----
         self.wandb_run = None
-        if args.wandb:
-            import wandb
-            run_name = args.run_name or f"{self.projective_dir.name}-{mode_tag}-P{args.num_points}-I{args.iterations}-seed{args.seed}"
+        if getattr(args, "wandb", False) and WANDB_AVAILABLE:
+            run_name = args.run_name or f"{self.dataset_path.name}-P{self.num_points}-I{self.iterations}-{random_string}"
             self.wandb_run = wandb.init(
                 project=args.wandb_project,
                 entity=args.wandb_entity or None,
                 name=run_name,
                 config={
-                    "projective_dir": str(self.projective_dir),
-                    "num_points": args.num_points,
-                    "iterations": args.iterations,
+                    "dataset": str(self.dataset_path),
+                    "num_points": self.num_points,
+                    "iterations": self.iterations,
                     "lr": args.lr,
                     "eval_every": args.eval_every,
                     "eval_opt_iters": args.eval_opt_iters,
+                    "eval_images": args.eval_images,
                     "seed": args.seed,
-                    "H": self.H, "W": self.W,
-                    "K": self.K, "J": self.J,
-                    "num_comps": self.num_comps,
+                    "K": self.K,
+                    "J": self.J,
+                    "psnr_threshold": args.psnr_threshold,
                 },
-                dir=str(self.out_dir),
+                dir=str(self.model_dir),
                 reinit=False,
             )
-            wandb.watch(self.model, log=None, log_freq=0, log_graph=False)
-            self._wandb = wandb
-        else:
-            self._wandb = None
+            wandb.watch(self.gaussian_model, log=None, log_freq=0, log_graph=False)
 
-        # caches
-        self._test_images_cache: Optional[List[Path]] = None
-        self._fixed_eval_paths: Optional[List[str]] = None
-        self._fixed_eval_manifest = self.out_dir / "eval_set.json"
+        self._test_images_cache = None
+        self._rng = np.random.default_rng(args.seed if args.seed is not None else 0)
 
-        # Optional: how many EM rows to use in projection; None = all
-        self._em_top_t: Optional[int] = None  # you can expose a CLI if you want
-
-    # ---------- test image discovery ----------
+    # ====== Utility: discover test images ======
     def _discover_test_images(self) -> List[Path]:
         if self._test_images_cache is not None:
             return self._test_images_cache
 
-        # priority 1: global split from new parser
-        all_test = self.projective_dir / "all_test"
-        if all_test.exists():
-            cand = sorted([p for p in all_test.iterdir() if p.suffix.lower() in IMG_EXTS and p.is_file()])
-            self._test_images_cache = cand
-            return cand
-
-        # priority 2: user-specified test_glob
         if self.args.test_glob:
-            cand = sorted(Path().glob(self.args.test_glob))
-            self._test_images_cache = cand
-            return cand
-
-        # priority 3: user-specified directory
-        if self.args.test_dir:
+            candidates = sorted(Path().glob(self.args.test_glob))
+        elif self.args.test_dir:
             root = Path(self.args.test_dir)
+            if not root.exists():
+                raise FileNotFoundError(f"--test_dir not found: {root}")
             it = root.rglob("*") if self.args.test_recursive else root.glob("*")
-            cand = sorted([p for p in it if p.suffix.lower() in IMG_EXTS and p.is_file()])
-            self._test_images_cache = cand
-            return cand
+            candidates = sorted([p for p in it if p.suffix.lower() in IMG_EXTS and p.is_file()])
+        else:
+            # fallback to common subdirs under dataset path
+            subdirs = ["test_imgs", "test", "images/test", "val_imgs", "val", "Test", "Val", "validation"]
+            found = []
+            for sd in subdirs:
+                p = self.dataset_path / sd
+                if p.exists():
+                    found.extend(sorted([q for q in p.rglob("*") if q.suffix.lower() in IMG_EXTS and q.is_file()]))
+            if not found:
+                found = sorted([q for q in self.dataset_path.rglob("*")
+                                if q.suffix.lower() in IMG_EXTS and q.is_file() and ("models" not in q.parts)])
+            candidates = found
 
-        # fallback: nothing
-        self._test_images_cache = []
-        return []
+        self._test_images_cache = candidates
+        return candidates
 
-    def _prepare_fixed_eval_set(self):
-        if self._fixed_eval_paths is not None:
-            return
-        if self._fixed_eval_manifest.exists():
-            loaded = json.loads(self._fixed_eval_manifest.read_text())
-            self._fixed_eval_paths = [p for p in loaded if Path(p).exists()]
-            return
-        cand = self._discover_test_images()
-        fixed = [str(p) for p in cand]
-        self._fixed_eval_manifest.write_text(json.dumps(fixed, indent=2))
-        self._fixed_eval_paths = fixed
+    # ====== Image helpers ======
+    def _load_ycbcr_tensor(self, path: Path) -> torch.Tensor:
+        img = Image.open(path).convert("RGB").resize((self.W, self.H), Image.Resampling.LANCZOS)
+        ycbcr = (color.rgb2ycbcr(np.array(img)) / 255.0).transpose(2, 0, 1)
+        return torch.tensor(ycbcr, dtype=torch.float32, device=self.device)
 
-    # ---------- Phase A ----------
-    def train(self, iterations: int):
-        self.model.train()
-        bar = tqdm(range(1, iterations + 1), desc="Phase-A (learn single-channel eigenimages)")
+    def _ycbcr_to_rgb_image(self, ycbcr_01: torch.Tensor) -> Image.Image:
+        ycbcr_img = (ycbcr_01.clamp(0, 1).detach().cpu().numpy() * 255.0).transpose(1, 2, 0)
+        rgb = color.ycbcr2rgb(ycbcr_img) * 255.0
+        rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+        return Image.fromarray(rgb)
 
-        for it in bar:
-            loss, psnr = self.model.train_iter(self.gt_arrs)
+    # ====== Checkpoint ======
+    def _save_checkpoint(self, step: int, tag: str):
+        ckpt = {
+            "step": step,
+            "model_state_dict": self.gaussian_model.state_dict(),
+            "optimizer_state_dict": getattr(self.gaussian_model, "optimizer", None).state_dict()
+                if hasattr(self.gaussian_model, "optimizer") else None,
+            "scheduler_state_dict": getattr(self.gaussian_model, "scheduler", None).state_dict()
+                if hasattr(self.gaussian_model, "scheduler") else None,
+            "rng": {
+                "python": random.getstate(),
+                "numpy": np.random.get_state(),
+                "torch": torch.get_rng_state(),
+                "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            },
+            "args": vars(self.args),
+        }
+        path = self.model_dir / f"ckpt_{tag}_{step:06d}.pth.tar"
+        torch.save(ckpt, path)
+        self.logwriter.write(f"[ckpt] saved {path}")
+        if self.wandb_run:
+            wandb.save(str(path), base_path=str(self.model_dir))
 
-            if self._wandb:
-                self._wandb.log({"train/loss": float(loss.item()), "train/psnr": float(psnr), "iter": it})
+    # ====== Cluster selection helper (distance to affine J-flat) ======
+    def _assign_cluster_for_channel(self, ch_name: str, x_flat: np.ndarray) -> int:
+        """
+        Pick nearest cluster for a 1×d vector using EM flats from parse_emlike.py:
+          em_Vs.npy: (K,J,d) with row-orthonormal basis rows
+          em_vs.npy: (K,d)   with affine offset v
+        """
+        ch_root = self.dataset_path / ch_name
+        Vs = np.load(ch_root / "em_Vs.npy")   # (K,J,d)
+        vs = np.load(ch_root / "em_vs.npy")   # (K,d)
+        x = torch.from_numpy(x_flat.astype(np.float32)).to(self.device)  # (d,)
+        Vs_t = torch.from_numpy(Vs.astype(np.float32)).to(self.device)   # (K,J,d)
+        vs_t = torch.from_numpy(vs.astype(np.float32)).to(self.device)   # (K,d)
 
-            if it % 10 == 0:
-                bar.set_postfix({"loss": f"{loss.item():.6f}", "psnr": f"{psnr:.3f}"})
+        diffs = x[None, :] - vs_t                 # (K,d)
+        y_v = torch.einsum('kjd,kd->kj', Vs_t, diffs)  # (K,J)
+        y_rec = torch.einsum('kjd,kj->kd', Vs_t, y_v)  # (K,d)
+        resid = diffs - y_rec                          # (K,d)
+        d2 = (resid ** 2).sum(dim=1)                   # (K,)
+        return int(torch.argmin(d2).item())
 
-            # periodic eval over the ENTIRE test set
-            if self.args.eval_every and (it % self.args.eval_every == 0):
-                self.eval_phaseB_on_test_set(global_iter=it)
+    # ====== Training loop (Phase-A) ======
+    def train(self):
+        progress_bar = tqdm(range(1, self.iterations + 1), desc="Training progress")
+        self.gaussian_model.train()
+        start_time = time.time()
 
-        # save
-        torch.save({"model_state_dict": self.model.state_dict()},
-                   self.out_dir / "gaussian_model_phaseA.pth.tar")
+        for iter_i in range(1, self.iterations + 1):
+            loss, psnr = self.gaussian_model.train_iter(self.gt_arrs)
 
-        # visualize learned components
-        self._dump_components()
+            if self.wandb_run:
+                wandb.log({"train/loss": float(loss.item()), "train/psnr": float(psnr), "iter": iter_i})
 
-    @torch.no_grad()
-    def _dump_components(self):
-        vis_dir = self.out_dir / "vis_components"
-        vis_dir.mkdir(parents=True, exist_ok=True)
-        comps = self.model.forward(render_colors=False).clamp(0,1)
-        for i in range(comps.shape[0]):
-            for ch in range(3):
-                arr = (comps[i, ch].cpu().numpy() * 255.0).astype(np.uint8)
-                Image.fromarray(arr, mode="L").save(vis_dir / f"{i:04d}_ch{ch}.png")
+            with torch.no_grad():
+                progress_bar.set_postfix({f"Loss": f"{loss.item():.{7}f}", "PSNR": f"{psnr:.{4}f},"})
+                progress_bar.update(1)
 
-    # ---------- Phase B (single image optimize) ----------
-    def optimize_single(self, image_path: Path, iters: int, log_every: int = 10):
-        gt = _rgb_path_to_ycbcr(image_path, (self.W, self.H)).to(self.device)
-        # EM-based per-channel init (closest cluster per channel, projected recon)
-        self._init_model_for_image_em(gt)  # image_mean becomes EM recon stack
+            if self.args.eval_every and (iter_i % self.args.eval_every == 0):
+                # periodic short Phase-B eval on a fixed test set
+                try:
+                    self.eval_phaseB_on_test_set(global_iter=iter_i)
+                    self._save_checkpoint(step=iter_i, tag="phaseA")
+                except Exception as e:
+                    self.logwriter.write(f"[eval warning] eval failed at iter {iter_i}: {e}")
 
-        # Switch the model to Phase-B mode (colors trainable, features frozen)
-        self.model.scheduler_init(optimize_phase=True)
-        self.model.train()
+        elapsed = time.time() - start_time
+        progress_bar.close()
+        self.logwriter.write(f"Training Complete in {elapsed:.4f}s")
+        torch.save({'model_state_dict': self.gaussian_model.state_dict()}, self.model_dir / "gaussian_model.pth.tar")
+        if self.wandb_run:
+            wandb.save(str(self.model_dir / "gaussian_model.pth.tar"), base_path=str(self.model_dir))
+        self.vis()
+        return
 
-        bar = tqdm(range(1, iters + 1), desc=f"Phase-B optimize {image_path.name}")
-        last_psnr = 0.0
+    # ====== Phase-B long optimize for a single image ======
+    def optimize(self):
+        progress_bar = tqdm(range(1, self.iterations + 1), desc="Optimizing progress")
+        self.update_gaussian()  # sets colors/means/scale/shift (clustered init)
+        self.gaussian_model.scheduler_init(optimize_phase=True)
+        self.gaussian_model.train()
+        start_time = time.perf_counter()
 
-        for it in bar:
-            loss, psnr = self.model.optimize_iter(gt)
-            last_psnr = float(psnr)
+        self.test(iter=0)
+        self.gaussian_model.train()
+        for iter_i in range(1, self.iterations + 1):
+            loss, psnr = self.gaussian_model.optimize_iter(self.gt_image)
+            self.psnr_tracker.check(start_time, psnr, iter_i)
 
-            if (it % log_every) == 0:
-                bar.set_postfix({"loss": f"{loss.item():.6f}", "psnr": f"{psnr:.3f}"})
-                if self._wandb:
-                    self._wandb.log({"phaseB/loss": float(loss.item()),
-                                     "phaseB/psnr": float(psnr),
-                                     "phaseB/iter": it}, step=it)
+            if self.wandb_run:
+                wandb.log({"phaseB/loss": float(loss.item()), "phaseB/psnr": float(psnr), "phaseB/iter": iter_i})
 
-        # Save final RGB preview
+            with torch.no_grad():
+                if iter_i in [10, 100, 1000]:
+                    self.test(iter=iter_i)
+                    self.gaussian_model.train()
+                if iter_i % 10 == 0:
+                    progress_bar.set_postfix({f"Loss": f"{loss.item():.{7}f}", "PSNR": f"{psnr:.{4}f},"})
+                    progress_bar.update(10)
+
+        elapsed = time.perf_counter() - start_time
+        progress_bar.close()
+        self.psnr_tracker.print_summary()
+        self.logwriter.write(f"Optimizing Complete in {elapsed:.4f}s")
+        torch.save({'model_state_dict': self.gaussian_model.state_dict()}, self.model_dir / "gaussian_model_with_colors.pth.tar")
+        if self.wandb_run:
+            wandb.save(str(self.model_dir / "gaussian_model_with_colors.pth.tar"), base_path=str(self.model_dir))
+        self.test()
+        return
+
+    # ====== Visualize learned eigen "components" ======
+    def vis(self):
+        self.gaussian_model.eval()
         with torch.no_grad():
-            outF = self.model.forward(render_colors=True)
-            imgF = (outF.view(3, -1) + self.model.image_mean).view(3, self.H, self.W).clamp(0, 1)
-        self._save_rgb(imgF, self.out_dir / f"{image_path.stem}_fitting.png")
+            image = self.gaussian_model()
+        mse_loss = F.mse_loss(image.float(), self.gt_arrs.float())
+        psnr = 10 * math.log10(1.0 / (mse_loss.item() + 1e-12))
+        ms_ssim_value = ms_ssim(image.float(), self.gt_arrs.float(), data_range=1, size_average=True).item()
+        self.logwriter.write(f"Components Fitting: PSNR:{psnr:.4f}, MS_SSIM:{ms_ssim_value:.6f}")
 
-        return last_psnr
+        vis_dir = self.model_dir / f"vis_comps"
+        vis_dir.mkdir(parents=True, exist_ok=True)
+        transform = transforms.ToPILImage()
+        array = image.float()
+        for i in range(array.shape[0]):
+            for j in range(array.shape[1]):
+                img = transform(array[i, j])
+                img.save(vis_dir / f"{i}-{j}.png")
+        return psnr, ms_ssim_value
 
-    # ---------- eval during Phase-A (EM-init, then short refine) ----------
+    # ====== Phase-B initialization: set colors/means/scale (clustered only) ======
+    def update_gaussian(self):
+        model = self.gaussian_model
+        d = self.H * self.W
+        img_arr = self.gt_image.detach().cpu().numpy().reshape(3, d)  # (3,d)
+
+        colors = torch.zeros((self.num_points, 3), device=self.device, dtype=torch.float32)
+        mean_tensor = torch.zeros((3, d), device=self.device, dtype=torch.float32)
+        sum_codes = np.zeros(3, dtype=np.float32)
+
+        psi = model.get_features  # (3,K,J,N)
+        with torch.no_grad():
+          psi.zero_()
+        for c_idx, ch_name in enumerate(["Y", "Cb", "Cr"]):
+            x = img_arr[c_idx]  # (d,)
+
+            # 1) nearest cluster via helper
+            k_c = self._assign_cluster_for_channel(ch_name, x)
+
+            # 2) project onto that cluster's PCA basis
+            cdir = self.dataset_path / ch_name / "clusters" / f"cluster_{k_c:02d}"
+            bases = np.load(cdir / "pca_bases.npy")  # (J,d)
+            mean  = np.load(cdir / "pca_mean.npy")   # (d,)
+            Xc = x - mean
+            w = Xc @ bases.T                         # (J,)
+
+            # 3) compose per-Gaussian color from psi[c,k_c,:,:]
+            psi_ck = psi[c_idx, k_c]                 # (J,N)
+            col_c = torch.from_numpy(w.astype(np.float32)).to(self.device) @ psi_ck  # (N,)
+            colors[:, c_idx] = col_c
+
+            mean_tensor[c_idx] = torch.from_numpy(mean.astype(np.float32)).to(self.device)
+            sum_codes[c_idx] = float(w.sum())
+
+        # 4) un-normalize using per-channel vmin/vmax estimated from raw bases
+        max_tensor = torch.from_numpy(self._vmax).to(self.device)
+        min_tensor = torch.from_numpy(self._vmin).to(self.device)
+        model.shift_factor = torch.from_numpy(sum_codes).to(self.device) * min_tensor
+        model.scale_factor = (max_tensor - min_tensor)
+        model.image_mean = mean_tensor
+
+        with torch.no_grad():
+            model._colors.copy_(colors)
+            _ = model(render_colors=True)
+
+    # ====== Test a single image (used in long optimize and at the end) ======
+    def test(self, iter: int | None = None):
+        self.gaussian_model.eval()
+        with torch.no_grad():
+            out = self.gaussian_model(render_colors=True)  # (3,H,W)
+        image = out.reshape(3, -1) + self.gaussian_model.image_mean
+        image = image.reshape(3, self.H, self.W).clamp(0, 1)
+
+        mse_loss = F.mse_loss(image.float(), self.gt_image.float())
+        psnr = 10 * math.log10(1.0 / (mse_loss.item() + 1e-12))
+        ms_ssim_value = ms_ssim(image.unsqueeze(0).float(), self.gt_image.unsqueeze(0).float(),
+                                data_range=1, size_average=True).item()
+        self.logwriter.write(f"Test PSNR:{psnr:.4f}, MS_SSIM:{ms_ssim_value:.6f}")
+
+        rgb_img = self._ycbcr_to_rgb_image(image)
+        name = f"{self.image_name}_{iter}_fitting.png" if iter is not None else f"{self.image_name}_fitting.png"
+        rgb_img.save(str(self.model_dir / name))
+        return psnr, ms_ssim_value
+
+    # ====== Fixed eval-set helpers ======
+    def _build_or_load_fixed_eval_set(self) -> List[Path]:
+        """
+        Build (or load) a deterministic list of test images.
+        Saves absolute paths to model_dir/eval_set.json so it's identical every eval.
+        """
+        fixed_path = self.model_dir / "eval_set.json"
+        if fixed_path.exists():
+            with open(fixed_path, "r") as f:
+                data = json.load(f)
+            paths = [Path(p) for p in data.get("paths", []) if Path(p).exists()]
+            if len(paths) > 0:
+                self._test_images_cache = paths
+                return paths
+
+        candidates = self._discover_test_images()
+        if len(candidates) == 0:
+            raise FileNotFoundError(
+                "No test images found. Provide --test_glob or --test_dir, "
+                "or place test images under your dataset path."
+            )
+
+        abs_paths = [str(p.resolve()) for p in candidates]
+        with open(fixed_path, "w") as f:
+            json.dump({"paths": abs_paths}, f, indent=2)
+
+        self._test_images_cache = [Path(p) for p in abs_paths]
+        return self._test_images_cache
+
+    def _phaseB_eval_single(self, base_state_dict: Dict[str, Any], img_path: Path, opt_iters: int,
+                            save_dir: Path | None = None) -> Dict[str, Any]:
+        """
+        Clone model → init Phase-B for img_path → run short optimize → collect metrics and images.
+        Also records PSNR/SSIM at every optimization iteration.
+        """
+        # fresh model copy (clustered settings)
+        model = GaussianBasis(
+            loss_type="L2", opt_type="adan", num_points=self.num_points,
+            H=self.H, W=self.W, BLOCK_H=16, BLOCK_W=16,
+            device=self.device, lr=self.args.lr,
+            num_comps=self.num_comps,
+            clustered=True, K_clusters=self.K, J_dim=self.J
+        ).to(self.device)
+        model.load_state_dict(base_state_dict)
+        model.eval()
+
+        # load image
+        gt_img = self._load_ycbcr_tensor(img_path)  # (3,H,W)
+        d = self.H * self.W
+
+        # ====== clustered init (same as update_gaussian, but for gt_img here) ======
+        img_arr = gt_img.detach().cpu().numpy().reshape(3, d)
+        colors = torch.zeros((self.num_points, 3), device=self.device, dtype=torch.float32)
+        mean_tensor = torch.zeros((3, d), device=self.device, dtype=torch.float32)
+        sum_codes = np.zeros(3, dtype=np.float32)
+        psi = model.get_features  # (3,K,J,N)
+
+
+        for c_idx, ch_name in enumerate(["Y", "Cb", "Cr"]):
+            x = img_arr[c_idx]
+            # nearest cluster via helper
+            k_c = self._assign_cluster_for_channel(ch_name, x)
+
+            # local PCA projection
+            cdir = self.dataset_path / ch_name / "clusters" / f"cluster_{k_c:02d}"
+            bases = np.load(cdir / "pca_bases.npy")  # (J,d)
+            mean  = np.load(cdir / "pca_mean.npy")   # (d,)
+            Xc = x - mean
+            w = Xc @ bases.T                         # (J,)
+
+            psi_ck = psi[c_idx, k_c]                 # (J,N)
+            col_c = torch.from_numpy(w.astype(np.float32)).to(self.device) @ psi_ck  # (N,)
+            colors[:, c_idx] = col_c
+
+            mean_tensor[c_idx] = torch.from_numpy(mean.astype(np.float32)).to(self.device)
+            sum_codes[c_idx] = float(w.sum())
+
+        max_tensor = torch.from_numpy(self._vmax).to(self.device)
+        min_tensor = torch.from_numpy(self._vmin).to(self.device)
+        model.shift_factor = torch.from_numpy(sum_codes).to(self.device) * min_tensor
+        model.scale_factor = (max_tensor - min_tensor)
+        model.image_mean = mean_tensor
+
+        with torch.no_grad():
+            model._colors.copy_(colors)
+
+        # ====== metrics at init ======
+        with torch.no_grad():
+            out0 = model(render_colors=True)                    # (3,H,W)
+            img0 = (out0.view(3, -1) + model.image_mean)        # (3,H*W)
+            img0 = img0.view(3, self.H, self.W).clamp(0, 1)     # (3,H,W)
+            mse0 = F.mse_loss(img0, gt_img).item()
+            psnr0 = 10 * math.log10(1.0 / (mse0 + 1e-12))
+            ssim0 = ms_ssim(img0.unsqueeze(0), gt_img.unsqueeze(0), data_range=1, size_average=True).item()
+
+        # ---- per-iter histories (include iter 0) ----
+        psnr_hist = [float(psnr0)]
+        ssim_hist = [float(ssim0)]
+
+        if save_dir is not None:
+            save_dir.mkdir(parents=True, exist_ok=True)
+            stem = img_path.stem
+            self._ycbcr_to_rgb_image(gt_img).save(save_dir / f"{stem}_gt.png")
+            self._ycbcr_to_rgb_image(img0).save(save_dir / f"{stem}_init.png")
+
+        # ====== short Phase-B refine ======
+        model.scheduler_init(optimize_phase=True)
+        model.train()
+        last_loss, last_psnr = None, None
+        for _ in range(opt_iters):
+            loss, psnr = model.optimize_iter(gt_img)
+            last_loss, last_psnr = float(loss.item()), float(psnr)
+
+            # record per-iter PSNR and SSIM (after this step)
+            with torch.no_grad():
+                out_t = model(render_colors=True)
+                img_t = (out_t.view(3, -1) + model.image_mean).view(3, self.H, self.W).clamp(0, 1)
+                ssim_t = ms_ssim(img_t.unsqueeze(0), gt_img.unsqueeze(0), data_range=1, size_average=True).item()
+            psnr_hist.append(float(psnr))
+            ssim_hist.append(float(ssim_t))
+
+        # ====== final metrics ======
+        model.eval()
+        with torch.no_grad():
+            outF = model(render_colors=True)
+            imgF = (outF.view(3, -1) + model.image_mean).view(3, self.H, self.W).clamp(0, 1)
+            mseF = F.mse_loss(imgF, gt_img).item()
+            psnrF = 10 * math.log10(1.0 / (mseF + 1e-12))
+            ssimF = ms_ssim(imgF.unsqueeze(0), gt_img.unsqueeze(0), data_range=1, size_average=True).item()
+
+        final_rgb = self._ycbcr_to_rgb_image(imgF)
+        if save_dir is not None:
+            final_rgb.save(save_dir / f"{img_path.stem}_final.png")
+
+        return {
+            "path": str(img_path),
+            "loss_init": mse0, "psnr_init": psnr0, "ssim_init": ssim0,
+            "loss_final": mseF, "psnr_final": psnrF, "ssim_final": ssimF,
+            "rgb_gt": self._ycbcr_to_rgb_image(gt_img),
+            "rgb_init": self._ycbcr_to_rgb_image(img0),
+            "rgb_final": final_rgb,
+            # per-iter histories
+            "psnr_hist": psnr_hist,
+            "ssim_hist": ssim_hist,
+        }
+
+    # ====== Evaluate Phase-B on a fixed test set during Phase-A ======
     def eval_phaseB_on_test_set(self, global_iter: int):
-        self._prepare_fixed_eval_set()
-        eval_root = self.out_dir / "eval" / f"iter_{global_iter:06d}"
-        (eval_root / "images").mkdir(parents=True, exist_ok=True)
+        eval_list = self._build_or_load_fixed_eval_set()
+
+        # snapshot model state so eval never mutates training model
+        base_state = copy.deepcopy(self.gaussian_model.state_dict())
+
+        eval_root = self.model_dir / "eval" / f"iter_{global_iter:06d}"
+        eval_root.mkdir(parents=True, exist_ok=True)
 
         rows = []
-        gallery_images = []
+        wandb_rows = []
+        psnr_hists, ssim_hists = [], []  # collect curves
+        for p in tqdm(eval_list, disable=True):
+            res = self._phaseB_eval_single(
+                base_state_dict=base_state,
+                img_path=p,
+                opt_iters=self.args.eval_opt_iters,
+                save_dir=eval_root
+            )
+            rows.append([
+                res["path"],
+                res["psnr_init"], res["ssim_init"], res["loss_init"],
+                res["psnr_final"], res["ssim_final"], res["loss_final"],
+            ])
+            psnr_hists.append(res["psnr_hist"])
+            ssim_hists.append(res["ssim_hist"])
 
-        psnr_init_list, psnr_final_list = [], []
-        ssim_init_list, ssim_final_list = [], []
+            if self.wandb_run:
+                wandb_rows.append([
+                    res["path"],
+                    wandb.Image(res["rgb_gt"],    caption=f"{Path(res['path']).name} • GT"),
+                    wandb.Image(res["rgb_init"],  caption=f"{Path(res['path']).name} • INIT  PSNR:{res['psnr_init']:.2f}  SSIM:{res['ssim_init']:.4f}"),
+                    wandb.Image(res["rgb_final"], caption=f"{Path(res['path']).name} • FINAL PSNR:{res['psnr_final']:.2f} SSIM:{res['ssim_final']:.4f}"),
+                    float(res["psnr_init"]), float(res["ssim_init"]),
+                    float(res["psnr_final"]), float(res["ssim_final"]),
+                ])
 
-        for pstr in self._fixed_eval_paths:
-            p = Path(pstr)
-            gt = _rgb_path_to_ycbcr(p, (self.W, self.H)).to(self.device)
+        arr = np.array(rows, dtype=object)
+        psnrI = np.array(arr[:, 1], dtype=float)
+        ssimI = np.array(arr[:, 2], dtype=float)
+        psnrF = np.array(arr[:, 4], dtype=float)
+        ssimF = np.array(arr[:, 5], dtype=float)
 
-            # clone → EM-init recon (per channel, per cluster) → quick refine
-            psnr0, ssim0, psnrF, ssimF, rgb_gt, rgb_init, rgb_final = \
-                self._short_phaseB_eval_with_images(gt)
+        # ---- Curves over Phase-B iterations (length = eval_opt_iters + 1) ----
+        psnr_mat = np.array(psnr_hists, dtype=float)  # [num_images, T+1]
+        ssim_mat = np.array(ssim_hists, dtype=float)
+        mean_psnr_curve = psnr_mat.mean(axis=0)
+        mean_ssim_curve = ssim_mat.mean(axis=0)
+        count_over_thr  = (psnr_mat >= float(self.args.psnr_threshold)).sum(axis=0)
 
-            psnr_init_list.append(psnr0); psnr_final_list.append(psnrF)
-            ssim_init_list.append(ssim0); ssim_final_list.append(ssimF)
+        # persist curves to disk
+        np.savez(eval_root / "curves.npz",
+                 iters=np.arange(psnr_mat.shape[1]),
+                 mean_psnr=mean_psnr_curve,
+                 mean_ssim=mean_ssim_curve,
+                 count_over_thr=count_over_thr,
+                 psnr_threshold=float(self.args.psnr_threshold))
 
-            # save to disk
-            stem = p.stem
-            rgb_gt.save(eval_root / "images" / f"{stem}_gt.png")
-            rgb_init.save(eval_root / "images" / f"{stem}_init.png")
-            rgb_final.save(eval_root / "images" / f"{stem}_final.png")
-
-            rows.append([str(p), psnr0, ssim0, psnrF, ssimF])
-
-            if self._wandb:
-                cap = f"{p.name} | init PSNR:{psnr0:.2f} SSIM:{ssim0:.4f} → final PSNR:{psnrF:.2f} SSIM:{ssimF:.4f}"
-                gallery_images += [
-                    self._wandb.Image(rgb_gt,   caption=f"{cap} | GT"),
-                    self._wandb.Image(rgb_init, caption=f"{cap} | INIT"),
-                    self._wandb.Image(rgb_final,caption=f"{cap} | FINAL"),
-                ]
-
-        # means
-        def _mean(x): return float(np.mean(x)) if len(x) else float("nan")
-        mean_psnr_init  = _mean(psnr_init_list)
-        mean_psnr_final = _mean(psnr_final_list)
-        mean_ssim_init  = _mean(ssim_init_list)
-        mean_ssim_final = _mean(ssim_final_list)
-
-        # print + file
-        msg = (f"[iter {global_iter}] EVAL on {len(rows)} images | "
-               f"init PSNR:{mean_psnr_init:.2f} SSIM:{mean_ssim_init:.4f} | "
-               f"final PSNR:{mean_psnr_final:.2f} SSIM:{mean_ssim_final:.4f}")
-        print(msg)
-        with open(eval_root / "metrics.txt", "w") as f:
-            print(msg, file=f)
+        txt_path = eval_root / "metrics.txt"
+        with open(txt_path, "w") as f:
+            print(f"[iter {global_iter}] #images={len(rows)}", file=f)
+            print(f"Init:  PSNR mean={psnrI.mean():.3f}  std={psnrI.std():.3f} | "
+                  f"SSIM mean={ssimI.mean():.4f}  std={ssimI.std():.4f}", file=f)
+            print(f"Final: PSNR mean={psnrF.mean():.3f}  std={psnrF.std():.3f} | "
+                  f"SSIM mean={ssimF.mean():.4f}  std={ssimF.std():.4f}", file=f)
+            print("", file=f)
+            print(f"PSNR threshold = {self.args.psnr_threshold:g}", file=f)
+            print(f"Mean PSNR curve: {mean_psnr_curve.tolist()}", file=f)
+            print(f"Mean SSIM curve: {mean_ssim_curve.tolist()}", file=f)
+            print(f"Count >= thr:   {count_over_thr.astype(int).tolist()}", file=f)
+            print("", file=f)
             for r in rows:
                 print(f"{Path(r[0]).name:30s}  "
                       f"initPSNR={r[1]:.2f} initSSIM={r[2]:.4f}  "
-                      f"finalPSNR={r[3]:.2f} finalSSIM={r[4]:.4f}", file=f)
+                      f"finalPSNR={r[4]:.2f} finalSSIM={r[5]:.4f}", file=f)
 
-        # wandb logging
-        if self._wandb:
-            table = self._wandb.Table(
-                data=rows, columns=["path","psnr_init","ssim_init","psnr_final","ssim_final"]
+        if self.wandb_run:
+            # images + metrics table + curves
+            table = wandb.Table(
+                data=wandb_rows,
+                columns=["path", "GT", "INIT", "FINAL", "psnr_init", "ssim_init", "psnr_final", "ssim_final"]
             )
-            self._wandb.log({
+            xs = list(range(mean_psnr_curve.shape[0]))
+            psnr_plot = wandb.plot.line_series(
+                xs=xs, ys=[mean_psnr_curve.tolist()], keys=["mean_psnr"],
+                title=f"Eval mean PSNR vs Phase-B iters (thr={self.args.psnr_threshold:g})", xname="Phase-B iter"
+            )
+            ssim_plot = wandb.plot.line_series(
+                xs=xs, ys=[mean_ssim_curve.tolist()], keys=["mean_ssim"],
+                title="Eval mean SSIM vs Phase-B iters", xname="Phase-B iter"
+            )
+            cnt_plot = wandb.plot.line_series(
+                xs=xs, ys=[count_over_thr.astype(int).tolist()],
+                keys=[f"count_psnr>= {self.args.psnr_threshold:g}"],
+                title="Count of images above PSNR threshold vs Phase-B iters", xname="Phase-B iter"
+            )
+            wandb.log({
                 "iter": global_iter,
                 "eval/num_images": int(len(rows)),
-                "eval/mean_psnr_init":  mean_psnr_init,
-                "eval/mean_ssim_init":  mean_ssim_init,
-                "eval/mean_psnr_final": mean_psnr_final,
-                "eval/mean_ssim_final": mean_ssim_final,
-                "eval/table": table,
-                "eval/gallery": gallery_images
+                "eval/mean_psnr_init": float(psnrI.mean()),
+                "eval/mean_psnr_final": float(psnrF.mean()),
+                "eval/mean_ssim_init": float(ssimI.mean()),
+                "eval/mean_ssim_final": float(ssimF.mean()),
+                "eval/table_images": table,
+                "eval/mean_psnr_curve": psnr_plot,
+                "eval/mean_ssim_curve": ssim_plot,
+                "eval/count_psnr_over_thr_curve": cnt_plot,
             }, step=global_iter)
 
-    # ---------- short Phase-B on a CLONED model; returns metrics + PIL images ----------
-    def _short_phaseB_eval_with_images(self, gt: torch.Tensor):
-        # clone state
-        m = GaussianBasis(loss_type=self.args.loss, opt_type="adan",
-                          num_points=self.args.num_points, num_comps=self.num_comps,
-                          H=self.H, W=self.W, BLOCK_H=16, BLOCK_W=16,
-                          device=self.device, lr=self.args.lr).to(self.device)
-        m.load_state_dict(self.model.state_dict())
 
-        # EM-based recon init (no grad): set image_mean to stacked per-channel EM projection
-        self._init_model_for_image_em(gt, model_override=m)
+# ================== CLI ==================
+def parse_args(argv):
+    parser = argparse.ArgumentParser(description="Clustered EigenGS training (per-channel projective clustering)")
 
-        with torch.no_grad():
-            out0 = m.forward(render_colors=True)
-            img0 = (out0.view(3, -1) + m.image_mean).view(3, self.H, self.W).clamp(0, 1)
-            mse0 = F.mse_loss(img0, gt).item()
-            psnr0 = 10 * math.log10(1.0 / (mse0 + 1e-12))
-            ssim0 = ms_ssim(img0.unsqueeze(0), gt.unsqueeze(0), data_range=1, size_average=True).item()
+    parser.add_argument("-d", "--dataset", type=str, required=True, help="Clustered dataset directory")
+    parser.add_argument("--iterations", type=int, default=50000, help="Training iterations (Phase-A) or optimize iterations (Phase-B)")
+    parser.add_argument("--num_points", type=int, default=50000, help="2D Gaussian count")
+    parser.add_argument("--model_path", type=str, default=None, help="Path to a checkpoint to resume from")
+    parser.add_argument("--image_path", type=str, default=None, help="If provided, run Phase-B optimize on this image after training")
+    parser.add_argument("--seed", type=int, default=1, help="Random seed")
+    parser.add_argument("--skip_train", action="store_true", help="Skip Phase-A training and go directly to Phase-B optimize (requires --model_path and --image_path)")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
 
-        # refine briefly
-        m.scheduler_init(optimize_phase=True)
-        m.train()
-        for _ in range(self.args.eval_opt_iters):
-            out = m.forward(render_colors=True)
-            img = (out.view(3, -1) + m.image_mean).view(3, self.H, self.W)
-            loss = F.mse_loss(img, gt)
-            loss.backward()
-            m.optimizer.step()
-            m.optimizer.zero_grad(set_to_none=True)
-            m.scheduler.step()
+    # W&B + Eval
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb_project", type=str, default=os.getenv("WANDB_PROJECT", "eigens"), help="W&B project")
+    parser.add_argument("--wandb_entity", type=str, default=None, help="W&B entity (optional)")
+    parser.add_argument("--run_name", type=str, default=None, help="W&B run name (optional)")
+    parser.add_argument("--eval_every", type=int, default=1000, help="Eval cadence in iters during Phase-A")
+    parser.add_argument("--eval_images", type=int, default=10, help="How many test images to evaluate (kept for compatibility)")
+    parser.add_argument("--eval_opt_iters", type=int, default=200, help="Short Phase-B iters per eval image")
+    parser.add_argument("--psnr_threshold", type=float, default=35.0,
+                        help="PSNR threshold for counting images above it during eval curves")
 
-        # final
-        m.eval()
-        with torch.no_grad():
-            outF = m.forward(render_colors=True)
-            imgF = (outF.view(3, -1) + m.image_mean).view(3, self.H, self.W).clamp(0, 1)
-            mseF = F.mse_loss(imgF, gt).item()
-            psnrF = 10 * math.log10(1.0 / (mseF + 1e-12))
-            ssimF = ms_ssim(imgF.unsqueeze(0), gt.unsqueeze(0), data_range=1, size_average=True).item()
+    # Test-set discovery
+    parser.add_argument("--test_glob", type=str, default=None, help="Glob for test images, e.g. './datasets/kodak/test/*.png'")
+    parser.add_argument("--test_dir", type=str, default=None, help="Directory containing test images")
+    parser.add_argument("--test_recursive", action="store_true", help="Recurse into subfolders of --test_dir")
 
-        # PIL images for gallery
-        rgb_gt    = self._ycbcr_to_rgb_pil(gt)
-        rgb_init  = self._ycbcr_to_rgb_pil(img0)
-        rgb_final = self._ycbcr_to_rgb_pil(imgF)
+    return parser.parse_args(argv)
 
-        return psnr0, ssim0, psnrF, ssimF, rgb_gt, rgb_init, rgb_final
-
-    @torch.no_grad()
-    def _init_model_for_image_em(self, gt_ycbcr: torch.Tensor, model_override=None):
-        """
-        EM-based per-channel cluster selection + projection init:
-          For each channel (Y/Cb/Cr):
-            k* = argmin ||(I - P_k)(x - v_k)||^2 using EM (V_k, v_k).
-            rec_ch = v_k* + Proj_{V_k*}(x - v_k*).
-          Stack rec_Y, rec_Cb, rec_Cr → set as model.image_mean (so init == EM recon).
-        """
-        model = self.model if model_override is None else model_override
-
-        Y  = gt_ycbcr[0]  # (H,W)
-        Cb = gt_ycbcr[1]
-        Cr = gt_ycbcr[2]
-
-        kY,  recY  = _choose_cluster_em_and_reconstruct(Y,  self.VsY_em,  self.vY_em,  self._em_top_t)
-        kCb, recCb = _choose_cluster_em_and_reconstruct(Cb, self.VsCb_em, self.vCb_em, self._em_top_t)
-        kCr, recCr = _choose_cluster_em_and_reconstruct(Cr, self.VsCr_em, self.vCr_em, self._em_top_t)
-
-        rec_img = _stack_recons(recY, recCb, recCr, self.H, self.W).to(self.device)  # (3,H,W)
-
-        # set the model's mean buffer to the EM reconstruction (init image)
-        model.image_mean = rec_img.view(3, -1).detach()
-
-        # Optional: clear/zero colors for a clean start if the model exposes a method
-        if hasattr(model, "zero_colors"):
-            model.zero_colors()
-
-    def load_model(self, ckpt_path: str):
-        ckpt = torch.load(ckpt_path, map_location=self.device)
-        state = ckpt.get("model_state_dict", ckpt)
-        # quick sanity check for num_comps
-        want = self.num_comps
-        got = state.get("_features_dc", None)
-        if got is not None and hasattr(got, "shape") and got.shape[0] != want:
-            raise RuntimeError(
-                f"Checkpoint num_comps mismatch: ckpt {got.shape[0]} vs current {want}. "
-                f"Make sure you trained with the same (3*K*J) configuration."
-            )
-        self.model.load_state_dict(state)
-        self.model.to(self.device)
-        self.model.eval()
-
-    @staticmethod
-    def _save_rgb(img_ycbcr_01: torch.Tensor, path: Path):
-        ycbcr = (img_ycbcr_01.clamp(0,1).detach().cpu().numpy() * 255.0).transpose(1,2,0)
-        rgb = color.ycbcr2rgb(ycbcr) * 255.0
-        Image.fromarray(np.clip(rgb,0,255).astype(np.uint8)).save(path)
-
-    @staticmethod
-    def _ycbcr_to_rgb_pil(img_ycbcr_01: torch.Tensor) -> Image.Image:
-        ycbcr = (img_ycbcr_01.clamp(0,1).detach().cpu().numpy() * 255.0).transpose(1,2,0)
-        rgb = color.ycbcr2rgb(ycbcr) * 255.0
-        return Image.fromarray(np.clip(rgb,0,255).astype(np.uint8))
-
-# ----------------------------- main -----------------------------
 
 def main(argv):
     args = parse_args(argv)
-    trainer = ProjectiveTrainer(args)
 
-    # If we're not training and user supplied a model, load it
-    if (args.skip_train or args.eval_only or args.image_path is not None) and args.model_path:
-        trainer.load_model(args.model_path)
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+        random.seed(int(args.seed))
+        np.random.seed(int(args.seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(int(args.seed))
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
 
-    # A) regular training path
-    if not args.skip_train and not args.eval_only:
-        trainer.train(args.iterations)
+    trainer = GaussianTrainer(
+        args, image_path=args.image_path, num_points=args.num_points,
+        iterations=args.iterations, model_path=args.model_path
+    )
 
-    # B) Phase-B on the whole test set (one pass)
-    if args.eval_only:
-        trainer.eval_phaseB_on_test_set(global_iter=0)
+    if not args.skip_train:
+        trainer.train()
 
-    # C) Optional: Phase-B on a single image
-    if args.image_path is not None:
-        trainer.optimize_single(Path(args.image_path), iters=args.eval_opt_iters)
+    if args.test_dir:
+        trainer.eval_phaseB_on_test_set(global_iter=args.eval_opt_iters)
+    elif args.image_path:
+        trainer.optimize()
+
 
 if __name__ == "__main__":
     main(sys.argv[1:])
